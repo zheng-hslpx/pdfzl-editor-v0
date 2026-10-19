@@ -37,9 +37,13 @@ _probe_cache: bool | None = None
 
 
 def soffice_functional() -> bool:
-    """True if soffice actually starts (a broken install exists but prints
-    nothing on --version; this machine's LibreOffice repack was exactly
-    that until bootstrap.ini was repaired). Cached per process."""
+    """True if soffice can actually convert a document.
+
+    A bare `--version` check is unreliable (this machine's build exits 0
+    silently even when broken), so we probe with a real minimal docx -> pdf
+    conversion. Result is cached per process; the first call may take
+    10-30s while LibreOffice initializes its profile.
+    """
     global _probe_cache
     if _probe_cache is not None:
         return _probe_cache
@@ -48,24 +52,51 @@ def soffice_functional() -> bool:
     if not Path(config.SOFFICE_PATH).exists():
         _probe_cache = False
         return False
+
     import subprocess
+    import tempfile
 
     try:
-        result = subprocess.run(
-            [config.SOFFICE_PATH, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        _probe_cache = result.returncode == 0 and bool(result.stdout.strip())
+        from docx import Document
+
+        with tempfile.TemporaryDirectory(prefix="lo-probe-") as tmp:
+            tmp_path = Path(tmp)
+            src = tmp_path / "probe.docx"
+            doc = Document()
+            doc.add_paragraph("probe")
+            doc.save(str(src))
+            outdir = tmp_path / "out"
+            outdir.mkdir()
+            profile = tmp_path / "profile"
+            profile.mkdir()
+            result = subprocess.run(
+                [
+                    config.SOFFICE_PATH,
+                    "--headless",
+                    "--norestore",
+                    "--nolockcheck",
+                    "--nodefault",
+                    f"-env:UserInstallation=file:///{quote(profile.as_posix(), safe=':/')}",
+                    "--convert-to",
+                    "pdf",
+                    "--outdir",
+                    str(outdir),
+                    str(src),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            _probe_cache = result.returncode == 0 and (outdir / "probe.pdf").exists()
     except Exception:
         _probe_cache = False
     return _probe_cache
 
 
 def _profile_url() -> str:
-    # file:///E:/path with percent-encoding (handles spaces in "PDF demo1")
-    return f"file:///{quote(_LO_PROFILE.as_posix())}"
+    # file:///E:/path — the drive colon must stay literal (encoding it as
+    # %3A makes LibreOffice fail to resolve the profile: rc=1, no output).
+    return f"file:///{quote(_LO_PROFILE.as_posix(), safe=':/')}"
 
 
 async def convert_to_pdf(src, timeout: int | None = None) -> "Path":  # noqa: F821
