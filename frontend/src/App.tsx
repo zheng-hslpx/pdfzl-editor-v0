@@ -6,7 +6,7 @@ import { FileProvider } from "./contexts/FileContext";
 import { checkHealth } from "./api/client";
 import { Home } from "./pages/Home";
 import { ToolPage } from "./pages/ToolPage";
-import { EditorPlaceholder } from "./pages/EditorPlaceholder";
+import { EditorPage } from "./pages/EditorPage";
 
 function Shell() {
   const [opened, { toggle }] = useDisclosure();
@@ -65,7 +65,7 @@ function Shell() {
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/tool/:toolId" element={<ToolPage />} />
-          <Route path="/editor" element={<EditorPlaceholder />} />
+          <Route path="/editor" element={<EditorPage />} />
           <Route path="*" element={<Home />} />
         </Routes>
       </AppShell.Main>

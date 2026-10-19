@@ -15,8 +15,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from . import config
 from .core.errors import PdfError, pdf_error_handler, unhandled_error_handler
 from .core.tempfile import temp_manager
-from .routers import convert, general, misc
+from .routers import convert, edit, general, misc
 from .services import libreoffice
+from .services.sessions import session_manager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,8 +34,13 @@ async def lifespan(_: FastAPI):
         while True:
             await asyncio.sleep(600)  # every 10 minutes
             removed = temp_manager.cleanup_old()
-            if removed:
-                logger.info("Cleaned up %d expired temp entries", removed)
+            sessions = session_manager.cleanup_expired()
+            if removed or sessions:
+                logger.info(
+                    "Cleaned up %d expired temp entries, %d edit sessions",
+                    removed,
+                    sessions,
+                )
 
     async def _lo_warmup() -> None:
         ok = await libreoffice.warmup()
@@ -67,6 +73,7 @@ app.add_exception_handler(Exception, unhandled_error_handler)
 app.include_router(general.router)
 app.include_router(convert.router)
 app.include_router(misc.router)
+app.include_router(edit.router)
 
 
 @app.get("/api/health")

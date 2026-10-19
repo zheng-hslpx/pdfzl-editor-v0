@@ -90,6 +90,20 @@ def save_atomic(doc: fitz.Document, path: Path, **options) -> None:
     os.replace(tmp, path)
 
 
+def commit_and_reload(doc: fitz.Document, path: Path, **options) -> fitz.Document:
+    """Atomically save doc back over `path` and return a fresh handle.
+
+    Required when saving over the document's own source file: PyMuPDF
+    holds the source open, and os.replace over an open handle fails
+    with WinError 5 on Windows.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    doc.save(str(tmp), **options)
+    doc.close()
+    os.replace(tmp, path)
+    return fitz.open(str(path))
+
+
 def close_quietly(doc: fitz.Document | None) -> None:
     if doc is not None:
         try:

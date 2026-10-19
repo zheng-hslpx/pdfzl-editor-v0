@@ -2,9 +2,14 @@ import { Suspense } from "react";
 import { Link, useParams } from "react-router-dom";
 import { Alert, Container, Loader, Stack, Text, Title } from "@mantine/core";
 import { getTool } from "../tools/registry";
+import { EditorPage } from "./EditorPage";
 
 export function ToolPage() {
   const { toolId } = useParams();
+
+  // The editor is a full-page experience, not a tool-flow page.
+  if (toolId === "editor") return <EditorPage />;
+
   const tool = getTool(toolId);
 
   if (!tool) {

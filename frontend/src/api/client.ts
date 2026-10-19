@@ -43,6 +43,12 @@ export async function postJson<T>(endpoint: string, form: FormData): Promise<T> 
   return resp.data;
 }
 
+/** POST a JSON body and return parsed JSON. */
+export async function postBody<T>(endpoint: string, body: unknown): Promise<T> {
+  const resp = await client.post<T>(endpoint, body);
+  return resp.data;
+}
+
 export function downloadBlob(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
