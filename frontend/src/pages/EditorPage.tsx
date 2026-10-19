@@ -26,6 +26,7 @@ import { openPdfDocument } from "../lib/pdfjs";
 import { useFiles } from "../contexts/FileContext";
 import * as editorApi from "../api/editor";
 import { extractError } from "../api/client";
+import { takePendingEditorFile } from "../lib/pendingFile";
 import type { PageModel, TextLine } from "../api/editor";
 
 type EditMode = "select" | "text" | "image" | "redact" | "rotate" | "delete" | "move";
@@ -149,6 +150,17 @@ export function EditorPage() {
     },
     [notify],
   );
+
+  // pick up a file handed over from a tool result ("在编辑器中打开")
+  const pickedUp = useRef(false);
+  useEffect(() => {
+    if (pickedUp.current) return;
+    const pending = takePendingEditorFile();
+    if (pending) {
+      pickedUp.current = true;
+      void openFile(pending);
+    }
+  }, [openFile]);
 
   // ------------------------------------------------------------------
   // save / save-as
