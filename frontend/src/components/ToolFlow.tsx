@@ -30,8 +30,11 @@ export interface ToolFlowProps {
   /** Caveats shown before executing (e.g. pdf2docx fidelity). */
   notices?: string[];
   /** Runs the tool; receives files in current order. */
-  execute: (files: ManagedFile[]) => Promise<FileResult>;
+  execute?: (files: ManagedFile[]) => Promise<FileResult>;
   resultKind: ResultKind;
+  /** JSON variant: renders a custom panel instead of a file result. */
+  executeJson?: (files: ManagedFile[]) => Promise<unknown>;
+  renderJson?: (data: unknown) => ReactNode;
 }
 
 /**
@@ -47,12 +50,15 @@ export function ToolFlow({
   notices,
   execute,
   resultKind,
+  executeJson,
+  renderJson,
 }: ToolFlowProps) {
   const { files, addFiles, removeFile, moveFile } = useFiles();
   const [active, setActive] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<FileResult | null>(null);
+  const [jsonData, setJsonData] = useState<unknown>(null);
   const [resultPreview, setResultPreview] = useState<ReactNode>(null);
 
   const canExecute = files.length >= minFiles && files.length <= (maxFiles === -1 ? Infinity : maxFiles);
@@ -61,9 +67,15 @@ export function ToolFlow({
     setBusy(true);
     setError(null);
     try {
-      const res = await execute(files);
-      setResult(res);
-      setResultPreview(renderPreview(res, resultKind));
+      if (executeJson) {
+        const data = await executeJson(files);
+        setJsonData(data);
+        setResultPreview(renderJson ? renderJson(data) : null);
+      } else if (execute) {
+        const res = await execute(files);
+        setResult(res);
+        setResultPreview(renderPreview(res, resultKind));
+      }
       setActive(3);
     } catch (err) {
       setError(await extractError(err));
@@ -74,6 +86,7 @@ export function ToolFlow({
 
   const reset = () => {
     setResult(null);
+    setJsonData(null);
     setResultPreview(null);
     setError(null);
     setActive(0);
@@ -212,19 +225,25 @@ export function ToolFlow({
         </Card>
       )}
 
-      {active === 3 && result && (
+      {active === 3 && (result || jsonData !== null) && (
         <Card withBorder padding="lg" radius="md">
           <Stack gap="md">
-            <Alert color="teal" title="处理完成">
-              {result.filename}
-            </Alert>
+            {result ? (
+              <Alert color="teal" title="处理完成">
+                {result.filename}
+              </Alert>
+            ) : (
+              <Alert color="teal" title="查询完成" />
+            )}
             <Group>
-              <Button
-                leftSection={<IconDownload size={16} />}
-                onClick={() => downloadBlob(result.blob, result.filename)}
-              >
-                下载文件
-              </Button>
+              {result && (
+                <Button
+                  leftSection={<IconDownload size={16} />}
+                  onClick={() => downloadBlob(result.blob, result.filename)}
+                >
+                  下载文件
+                </Button>
+              )}
               <Button variant="default" onClick={reset}>
                 处理其他文件
               </Button>
