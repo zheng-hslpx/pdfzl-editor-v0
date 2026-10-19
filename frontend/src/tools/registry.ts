@@ -157,7 +157,10 @@ export const TOOLS: ToolDef[] = [
     icon: IconPencil,
     maxFiles: 1,
     accepts: ".pdf,application/pdf",
-    available: false,
+    available: true,
+    component: lazy(() =>
+      import("../pages/EditorPage").then((m) => ({ default: m.EditorPage })),
+    ),
   },
 ];
 
