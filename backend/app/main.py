@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from . import config
 from .core.errors import PdfError, pdf_error_handler, unhandled_error_handler
 from .core.tempfile import temp_manager
+from .routers import general
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,6 +56,8 @@ app.add_middleware(
 
 app.add_exception_handler(PdfError, pdf_error_handler)
 app.add_exception_handler(Exception, unhandled_error_handler)
+
+app.include_router(general.router)
 
 
 @app.get("/api/health")
