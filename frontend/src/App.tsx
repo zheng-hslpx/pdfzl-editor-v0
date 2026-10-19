@@ -1,53 +1,84 @@
 import { useEffect, useState } from "react";
 import { BrowserRouter, Route, Routes } from "react-router-dom";
-import { Alert, Badge, Card, Container, Text, Title } from "@mantine/core";
+import { AppShell, Badge, Burger, Group, Text, Title } from "@mantine/core";
+import { useDisclosure } from "@mantine/hooks";
+import { FileProvider } from "./contexts/FileContext";
 import { checkHealth } from "./api/client";
+import { Home } from "./pages/Home";
+import { ToolPage } from "./pages/ToolPage";
+import { EditorPlaceholder } from "./pages/EditorPlaceholder";
 
-function Home() {
-  const [health, setHealth] = useState("检查中…");
-  const [ok, setOk] = useState<boolean | null>(null);
+function Shell() {
+  const [opened, { toggle }] = useDisclosure();
+  const [backend, setBackend] = useState<"ok" | "down" | "checking">("checking");
 
   useEffect(() => {
     checkHealth()
-      .then((r) => {
-        setHealth(r.status);
-        setOk(true);
-      })
-      .catch(() => {
-        setHealth("后端未连接");
-        setOk(false);
-      });
+      .then(() => setBackend("ok"))
+      .catch(() => setBackend("down"));
   }, []);
 
   return (
-    <Container size="sm" py="xl">
-      <Title order={1}>PDF Editor</Title>
-      <Text c="dimmed" mb="lg">
-        架构模式参考 Stirling-PDF 的轻量级 PDF 编辑器
-      </Text>
-      <Card withBorder padding="lg" radius="md">
-        <Text fw={600} mb="xs">
-          后端状态
+    <AppShell
+      header={{ height: 56 }}
+      navbar={{ width: 220, breakpoint: "sm", collapsed: { mobile: !opened } }}
+      padding="md"
+    >
+      <AppShell.Header>
+        <Group h="100%" px="md" justify="space-between">
+          <Group>
+            <Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
+            <Title order={4}>PDF Editor</Title>
+          </Group>
+          <Badge
+            color={backend === "ok" ? "teal" : backend === "down" ? "red" : "gray"}
+            variant="light"
+          >
+            {backend === "ok" ? "后端已连接" : backend === "down" ? "后端未连接" : "检查中…"}
+          </Badge>
+        </Group>
+      </AppShell.Header>
+
+      <AppShell.Navbar p="md">
+        <Text size="xs" c="dimmed" fw={700} mb="xs">
+          导航
         </Text>
-        <Badge color={ok ? "teal" : ok === null ? "gray" : "red"} variant="light">
-          {health}
-        </Badge>
-        {ok === false && (
-          <Alert color="yellow" title="提示" mt="md">
-            请先启动后端：cd backend &amp;&amp; uvicorn app.main:app --port 8000
-          </Alert>
-        )}
-      </Card>
-    </Container>
+        <Text
+          component="a"
+          href="/"
+          size="sm"
+          style={{ display: "block", marginBottom: 8, textDecoration: "none" }}
+        >
+          全部工具
+        </Text>
+        <Text
+          component="a"
+          href="/editor"
+          size="sm"
+          style={{ display: "block", textDecoration: "none" }}
+        >
+          可视化编辑器
+        </Text>
+      </AppShell.Navbar>
+
+      <AppShell.Main>
+        <Routes>
+          <Route path="/" element={<Home />} />
+          <Route path="/tool/:toolId" element={<ToolPage />} />
+          <Route path="/editor" element={<EditorPlaceholder />} />
+          <Route path="*" element={<Home />} />
+        </Routes>
+      </AppShell.Main>
+    </AppShell>
   );
 }
 
 export function App() {
   return (
-    <BrowserRouter>
-      <Routes>
-        <Route path="/" element={<Home />} />
-      </Routes>
-    </BrowserRouter>
+    <FileProvider>
+      <BrowserRouter>
+        <Shell />
+      </BrowserRouter>
+    </FileProvider>
   );
 }
