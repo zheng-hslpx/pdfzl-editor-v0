@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   Alert,
   Box,
@@ -12,9 +13,18 @@ import {
   Text,
   Title,
 } from "@mantine/core";
-import { IconDownload, IconFile, IconPlus, IconTrash, IconArrowUp, IconArrowDown } from "@tabler/icons-react";
+import {
+  IconDownload,
+  IconFile,
+  IconPencil,
+  IconPlus,
+  IconTrash,
+  IconArrowUp,
+  IconArrowDown,
+} from "@tabler/icons-react";
 import { useFiles, formatSize, type ManagedFile } from "../contexts/FileContext";
 import { downloadBlob, extractError, type FileResult } from "../api/client";
+import { setPendingEditorFile } from "../lib/pendingFile";
 import { PdfViewer } from "./PdfViewer";
 
 export type ResultKind = "pdf" | "zip" | "image" | "text" | "json" | "docx";
@@ -54,6 +64,7 @@ export function ToolFlow({
   renderJson,
 }: ToolFlowProps) {
   const { files, addFiles, removeFile, moveFile } = useFiles();
+  const navigate = useNavigate();
   const [active, setActive] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -242,6 +253,21 @@ export function ToolFlow({
                   onClick={() => downloadBlob(result.blob, result.filename)}
                 >
                   下载文件
+                </Button>
+              )}
+              {result && resultKind === "pdf" && (
+                <Button
+                  variant="light"
+                  leftSection={<IconPencil size={16} />}
+                  onClick={() => {
+                    const file = new File([result.blob], result.filename, {
+                      type: "application/pdf",
+                    });
+                    setPendingEditorFile(file);
+                    navigate("/editor");
+                  }}
+                >
+                  在编辑器中打开
                 </Button>
               )}
               <Button variant="default" onClick={reset}>
