@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Alert,
@@ -7,6 +7,7 @@ import {
   Card,
   FileButton,
   Group,
+  Progress,
   Paper,
   Stack,
   Stepper,
@@ -23,7 +24,14 @@ import {
   IconArrowDown,
 } from "@tabler/icons-react";
 import { useFiles, formatSize, type ManagedFile } from "../contexts/FileContext";
-import { downloadBlob, extractError, type FileResult } from "../api/client";
+import {
+  downloadBlob,
+  extractError,
+  JobCancelledError,
+  type FileResult,
+  type JobOptions,
+  type JobProgress,
+} from "../api/client";
 import { setPendingEditorFile } from "../lib/pendingFile";
 import { PdfViewer } from "./PdfViewer";
 
@@ -40,10 +48,10 @@ export interface ToolFlowProps {
   /** Caveats shown before executing (e.g. pdf2docx fidelity). */
   notices?: string[];
   /** Runs the tool; receives files in current order. */
-  execute?: (files: ManagedFile[]) => Promise<FileResult>;
+  execute?: (files: ManagedFile[], options: JobOptions) => Promise<FileResult>;
   resultKind: ResultKind;
   /** JSON variant: renders a custom panel instead of a file result. */
-  executeJson?: (files: ManagedFile[]) => Promise<unknown>;
+  executeJson?: (files: ManagedFile[], options: JobOptions) => Promise<unknown>;
   renderJson?: (data: unknown) => ReactNode;
 }
 
@@ -71,29 +79,47 @@ export function ToolFlow({
   const [result, setResult] = useState<FileResult | null>(null);
   const [jsonData, setJsonData] = useState<unknown>(null);
   const [resultPreview, setResultPreview] = useState<ReactNode>(null);
+  const [jobProgress, setJobProgress] = useState<JobProgress | null>(null);
+  const jobController = useRef<AbortController | null>(null);
+
+  const totalFileBytes = files.reduce((total, file) => total + file.size, 0);
+  const maxRequestBytes = 600 * 1024 * 1024;
+  const nearRequestLimit = totalFileBytes >= maxRequestBytes - 64 * 1024;
 
   const canExecute = files.length >= minFiles && files.length <= (maxFiles === -1 ? Infinity : maxFiles);
 
   const run = async () => {
+    const controller = new AbortController();
+    jobController.current = controller;
     setBusy(true);
     setError(null);
+    setJobProgress(null);
     try {
       if (executeJson) {
-        const data = await executeJson(files);
+        const data = await executeJson(files, {
+          signal: controller.signal,
+          onProgress: setJobProgress,
+        });
         setJsonData(data);
         setResultPreview(renderJson ? renderJson(data) : null);
       } else if (execute) {
-        const res = await execute(files);
+        const res = await execute(files, {
+          signal: controller.signal,
+          onProgress: setJobProgress,
+        });
         setResult(res);
         setResultPreview(renderPreview(res, resultKind));
       }
       setActive(3);
     } catch (err) {
-      setError(await extractError(err));
+      setError(err instanceof JobCancelledError ? "任务已取消" : await extractError(err));
     } finally {
+      jobController.current = null;
       setBusy(false);
     }
   };
+
+  const cancelJob = () => jobController.current?.abort();
 
   const reset = () => {
     setResult(null);
@@ -115,6 +141,10 @@ export function ToolFlow({
       {active === 0 && (
         <Card withBorder padding="lg" radius="md">
           <Stack gap="md">
+            <Alert color={nearRequestLimit ? "orange" : "blue"} title="单次请求大小上限">
+              所选文件合计 {formatSize(totalFileBytes)}。整个 multipart 请求（含所有文件、字段和边界）不得超过 600 MiB；
+              接近上限时请减少文件或拆分请求。
+            </Alert>
             <Group>
               <FileButton onChange={addFiles} accept={accepts} multiple>
                 {(props) => (
@@ -200,6 +230,11 @@ export function ToolFlow({
                 {n}
               </Alert>
             ))}
+            {totalFileBytes >= maxRequestBytes && (
+              <Alert color="red" title="文件总量已超过上限">
+                多个文件合计已超过 600 MiB，单次请求无法提交。
+              </Alert>
+            )}
             <Group justify="space-between">
               <Button variant="default" onClick={() => setActive(0)}>
                 上一步
@@ -219,6 +254,29 @@ export function ToolFlow({
               即将处理 {files.length} 个文件：
               {files.map((f) => f.name).join("、")}
             </Text>
+            <Text size="sm" c="dimmed">
+              文件合计 {formatSize(totalFileBytes)}；完整请求体上限为 600 MiB。服务器最多同时运行 1 个任务并排队 1 个任务。
+            </Text>
+            {busy && jobProgress && (
+              <Alert color="blue" title={jobProgress.state === "queued" ? "任务排队中" : "任务处理中"}>
+                <Stack gap="xs">
+                  <Text size="sm">
+                    {jobProgress.progress?.phase ?? jobProgress.state}
+                    {jobProgress.progress?.total
+                      ? `：${jobProgress.progress.completed ?? 0}/${jobProgress.progress.total} ${jobProgress.progress.unit ?? ""}`
+                      : ""}
+                  </Text>
+                  {jobProgress.progress?.total ? (
+                    <Progress
+                      value={Math.min(100, ((jobProgress.progress.completed ?? 0) / jobProgress.progress.total) * 100)}
+                    />
+                  ) : null}
+                  {jobProgress.cancelTooLate && (
+                    <Text size="xs">任务已进入提交阶段，取消不再生效，请等待完成。</Text>
+                  )}
+                </Stack>
+              </Alert>
+            )}
             {error && (
               <Alert color="red" title="处理失败">
                 {error}
@@ -228,9 +286,15 @@ export function ToolFlow({
               <Button variant="default" onClick={() => setActive(1)} disabled={busy}>
                 上一步
               </Button>
-              <Button onClick={run} loading={busy} disabled={!canExecute}>
-                开始处理
-              </Button>
+              {busy ? (
+                <Button color="red" variant="light" onClick={cancelJob} disabled={jobProgress?.cancelTooLate}>
+                  取消任务
+                </Button>
+              ) : (
+                <Button onClick={run} disabled={!canExecute || totalFileBytes >= maxRequestBytes}>
+                  开始处理
+                </Button>
+              )}
             </Group>
           </Stack>
         </Card>

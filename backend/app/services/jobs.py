@@ -18,7 +18,7 @@ from typing import Any
 from .. import config
 from ..core.errors import PdfError
 from ..core.tempfile import temp_manager
-from .sessions import session_manager
+from .sessions import SessionHistoryEntry, session_manager
 from .windows_job import WindowsJobObject
 
 logger = logging.getLogger("pdf_editor.jobs")
@@ -31,6 +31,7 @@ _SESSION_MUTATIONS = {
     "editor_rotate",
     "editor_delete",
     "editor_move",
+    "editor_history_restore",
 }
 
 
@@ -59,6 +60,14 @@ class JobRecord:
     process: multiprocessing.Process | None = None
     cancel_event: Any = None
     done_event: asyncio.Event | None = None
+    history_mode: str | None = None
+    history_policy: str | None = None
+    history_action: str | None = None
+    history_entry: SessionHistoryEntry | None = None
+    history_snapshot_path: Path | None = None
+    history_before_page_ids: list[str] | None = None
+    history_before_page_metadata: list[dict] | None = None
+    history_evict_count: int = 0
 
 
 class JobManager:
@@ -136,6 +145,10 @@ class JobManager:
         expected_revision: int | None = None,
         cleanup_session_on_failure: bool = False,
         idempotency_scope: str | None = None,
+        history_mode: str | None = None,
+        history_policy: str | None = None,
+        history_action: str | None = None,
+        history_entry: SessionHistoryEntry | None = None,
     ) -> JobRecord:
         if self._queue is None:
             raise PdfError(503, "后台任务服务尚未启动", code="JOB_SERVICE_UNAVAILABLE")
@@ -181,6 +194,8 @@ class JobManager:
             expected_revision=expected_revision,
             cleanup_session_on_failure=cleanup_session_on_failure,
             done_event=asyncio.Event(),
+            history_action=history_action,
+            history_entry=history_entry,
         )
 
         session = None
@@ -192,9 +207,16 @@ class JobManager:
                         raise PdfError(409, "文档版本已变化，请刷新后重试", code="REVISION_CONFLICT")
                     if session.pending_job_id is not None:
                         raise PdfError(409, "该文档已有任务正在处理", code="SESSION_BUSY")
+                    self._prepare_history(
+                        session,
+                        job,
+                        history_mode=history_mode,
+                        history_policy=history_policy,
+                    )
                     session.pending_job_id = job_id
             except BaseException:
                 shutil.rmtree(work_dir, ignore_errors=True)
+                self._discard_pending_history_snapshot(job)
                 self._discard_inputs(paths)
                 if cleanup_session_on_failure and session_id:
                     session_manager.close(session_id)
@@ -207,6 +229,7 @@ class JobManager:
                 with session.lock:
                     if session.pending_job_id == job_id:
                         session.pending_job_id = None
+            self._discard_pending_history_snapshot(job)
             shutil.rmtree(work_dir, ignore_errors=True)
             self._discard_inputs(paths)
             if cleanup_session_on_failure and session_id:
@@ -216,6 +239,177 @@ class JobManager:
         self._records[job_id] = job
         self._idempotency[idem_index] = (request_hash, job_id, time.time())
         return job
+
+    @staticmethod
+    def history_plan(session, mode: str = "snapshot") -> dict[str, Any]:
+        undo_bytes = sum(entry.size_bytes for entry in session.undo_stack)
+        redo_bytes = sum(entry.size_bytes for entry in session.redo_stack)
+        estimate = session.path.stat().st_size if mode == "snapshot" else 0
+        effective_steps = len(session.undo_stack)
+        effective_bytes = undo_bytes
+        needs_confirmation = (
+            effective_steps + 1 > config.EDITOR_HISTORY_MAX_STEPS
+            or effective_bytes + estimate > config.EDITOR_HISTORY_MAX_BYTES
+        )
+        evict_count = 0
+        remaining_steps = effective_steps
+        remaining_bytes = effective_bytes
+        while (
+            remaining_steps + 1 > config.EDITOR_HISTORY_MAX_STEPS
+            or remaining_bytes + estimate > config.EDITOR_HISTORY_MAX_BYTES
+        ) and evict_count < len(session.undo_stack):
+            oldest = session.undo_stack[evict_count]
+            remaining_steps -= 1
+            remaining_bytes -= oldest.size_bytes
+            evict_count += 1
+        can_evict = (
+            remaining_steps + 1 <= config.EDITOR_HISTORY_MAX_STEPS
+            and remaining_bytes + estimate <= config.EDITOR_HISTORY_MAX_BYTES
+        )
+        return {
+            "needsConfirmation": needs_confirmation,
+            "mode": mode,
+            "currentSteps": len(session.undo_stack) + len(session.redo_stack),
+            "maxSteps": config.EDITOR_HISTORY_MAX_STEPS,
+            "currentBytes": undo_bytes + redo_bytes,
+            "maxBytes": config.EDITOR_HISTORY_MAX_BYTES,
+            "estimateBytes": estimate,
+            "canEvictOldest": can_evict,
+            "canSkipUndo": True,
+        }
+
+    @staticmethod
+    def history_transition_plan(session, action: str) -> dict[str, Any]:
+        source = session.undo_stack if action == "undo" else session.redo_stack
+        if not source:
+            raise PdfError(409, "没有可用的撤销/重做记录", code="HISTORY_EMPTY")
+        entry = source[-1]
+        total_bytes = sum(item.size_bytes for item in session.undo_stack + session.redo_stack)
+        current_size = session.path.stat().st_size if entry.kind == "snapshot" else 0
+        projected = total_bytes - entry.size_bytes + current_size
+        needs_confirmation = projected > config.EDITOR_HISTORY_MAX_BYTES
+        return {
+            "mode": entry.kind,
+            "needsConfirmation": needs_confirmation,
+            "currentSteps": len(session.undo_stack) + len(session.redo_stack),
+            "maxSteps": config.EDITOR_HISTORY_MAX_STEPS,
+            "currentBytes": total_bytes,
+            "maxBytes": config.EDITOR_HISTORY_MAX_BYTES,
+            "estimateBytes": current_size,
+            "canEvictOldest": current_size <= config.EDITOR_HISTORY_MAX_BYTES,
+            "canSkipUndo": True,
+        }
+
+    def _prepare_history(
+        self,
+        session,
+        job: JobRecord,
+        *,
+        history_mode: str | None,
+        history_policy: str | None,
+    ) -> None:
+        if job.history_action:
+            job.history_before_page_ids = list(session.page_ids)
+            job.history_before_page_metadata = list(session.page_metadata)
+            expected_stack = session.undo_stack if job.history_action == "undo" else session.redo_stack
+            if not expected_stack or job.history_entry is None or expected_stack[-1].id != job.history_entry.id:
+                raise PdfError(409, "撤销/重做历史已变化", code="HISTORY_CONFLICT")
+            job.history_mode = "transition"
+            job.history_policy = history_policy
+            self._validate_history_transition(session, job)
+            return
+
+        if job.operation not in _SESSION_MUTATIONS:
+            return
+        mode = history_mode or ("inverse" if job.operation in {"editor_rotate", "editor_move"} else "snapshot")
+        if mode not in {"snapshot", "inverse", "none"}:
+            raise PdfError(422, "历史记录模式无效", code="INVALID_HISTORY_MODE")
+        if history_policy not in {None, "snapshot", "evict_oldest", "no_undo"}:
+            raise PdfError(422, "历史记录策略无效", code="INVALID_HISTORY_POLICY")
+        job.history_policy = history_policy
+        job.history_before_page_ids = list(session.page_ids)
+        job.history_before_page_metadata = list(session.page_metadata)
+
+        if history_policy == "no_undo":
+            mode = "none"
+        if mode in {"snapshot", "inverse"}:
+            plan = self.history_plan(session, mode)
+            if plan["needsConfirmation"] and history_policy not in {"evict_oldest"}:
+                raise PdfError(
+                    409,
+                    "撤销历史容量不足，请选择淘汰最旧历史、此次不保留撤销或取消",
+                    code="HISTORY_CAPACITY_CONFIRMATION_REQUIRED",
+                )
+            if plan["needsConfirmation"] and not plan["canEvictOldest"] and history_policy == "evict_oldest":
+                raise PdfError(
+                    409,
+                    "当前文件超过撤销历史容量，无法保留本次撤销；请选择本次不保留撤销或取消",
+                    code="HISTORY_SNAPSHOT_TOO_LARGE",
+                )
+            if history_policy == "evict_oldest":
+                job.history_evict_count = self._history_evict_count(session, mode)
+
+        job.history_mode = mode
+        if mode == "snapshot":
+            history_dir = session.path.parent / "history"
+            history_dir.mkdir(parents=True, exist_ok=True)
+            snapshot = history_dir / f"pending-{job.id}.pdf"
+            try:
+                os.link(session.path, snapshot)
+            except OSError as exc:
+                raise PdfError(
+                    507,
+                    "无法创建安全的撤销快照；可改为本次不保留撤销",
+                    code="HISTORY_SNAPSHOT_UNAVAILABLE",
+                ) from exc
+            job.history_snapshot_path = snapshot
+
+    @staticmethod
+    def _history_evict_count(session, mode: str) -> int:
+        if mode == "none":
+            return 0
+        estimate = session.path.stat().st_size if mode == "snapshot" else 0
+        steps = len(session.undo_stack)
+        used = sum(entry.size_bytes for entry in session.undo_stack)
+        count = 0
+        while (
+            steps - count + 1 > config.EDITOR_HISTORY_MAX_STEPS
+            or used - sum(entry.size_bytes for entry in session.undo_stack[:count]) + estimate
+            > config.EDITOR_HISTORY_MAX_BYTES
+        ) and count < len(session.undo_stack):
+            count += 1
+        return count
+
+    def _validate_history_transition(self, session, job: JobRecord) -> None:
+        assert job.history_entry is not None and job.history_action is not None
+        entry = job.history_entry
+        policy = job.history_policy
+        if policy not in {None, "evict_oldest", "no_undo"}:
+            raise PdfError(422, "历史操作策略无效", code="INVALID_HISTORY_POLICY")
+        if entry.kind != "snapshot":
+            return
+        projected_bytes = (
+            sum(item.size_bytes for item in session.undo_stack + session.redo_stack)
+            - entry.size_bytes
+            + session.path.stat().st_size
+        )
+        if projected_bytes <= config.EDITOR_HISTORY_MAX_BYTES or policy in {"evict_oldest", "no_undo"}:
+            return
+        raise PdfError(
+            409,
+            "撤销/重做将超过历史容量，请选择淘汰最旧历史、本次不保留重做或取消",
+            code="HISTORY_CAPACITY_CONFIRMATION_REQUIRED",
+        )
+
+    @staticmethod
+    def _discard_pending_history_snapshot(job: JobRecord) -> None:
+        if job.history_snapshot_path is None:
+            return
+        try:
+            job.history_snapshot_path.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("Could not remove pending history snapshot for job %s", job.id)
+        job.history_snapshot_path = None
 
     def get(self, job_id: str) -> JobRecord:
         job = self._records.get(job_id)
@@ -470,13 +664,42 @@ class JobManager:
                     self._release_session(job)
                     return
                 job.state = "committing"
+                current_snapshot: Path | None = None
+                if (
+                    job.history_action
+                    and job.history_entry is not None
+                    and job.history_entry.kind == "snapshot"
+                    and job.history_policy != "no_undo"
+                ):
+                    history_dir = session.path.parent / "history"
+                    history_dir.mkdir(parents=True, exist_ok=True)
+                    current_snapshot = history_dir / f"pending-transition-{job.id}.pdf"
+                    try:
+                        os.link(session.path, current_snapshot)
+                    except OSError:
+                        current_snapshot = None
+                        self._finish(
+                            job,
+                            "failed",
+                            {"code": "HISTORY_SNAPSHOT_UNAVAILABLE", "message": "无法保留重做快照"},
+                        )
+                        self._release_session(job)
+                        return
                 try:
                     os.replace(artifact, session.path)
                 except OSError:
+                    if current_snapshot is not None:
+                        current_snapshot.unlink(missing_ok=True)
                     self._finish(job, "failed", {"code": "COMMIT_FAILED", "message": "无法安全提交 PDF 修改"})
                     self._release_session(job)
                     return
                 session.page_ids = list(result["data"]["pageIds"])
+                if "pages" in result["data"]:
+                    session.page_metadata = list(result["data"]["pages"])
+                if job.history_action:
+                    self._apply_history_transition(session, job, current_snapshot)
+                else:
+                    self._commit_new_history(session, job)
                 session.revision += 1
                 result["data"]["revision"] = session.revision
                 job.result = result["data"]
@@ -493,11 +716,130 @@ class JobManager:
 
         if kind == "json":
             job.result = result.get("data")
+            if job.operation == "editor_open" and job.session_id:
+                session = session_manager.get(job.session_id)
+                with session.lock:
+                    if not session.closed:
+                        data = job.result or {}
+                        session.page_metadata = list(data.pop("_allPageMetadata", data.get("pages", [])))
             self._finish(job, "succeeded")
             return
 
         self._finish(job, "failed", {"code": "WORKER_FAILED", "message": "任务结果格式无效"})
         self._release_session(job)
+
+    def _commit_new_history(self, session, job: JobRecord) -> None:
+        self._clear_history_stack(session.redo_stack)
+        if job.history_mode == "none":
+            self._clear_history_stack(session.undo_stack)
+            self._discard_pending_history_snapshot(job)
+            return
+        for _ in range(min(job.history_evict_count, len(session.undo_stack))):
+            self._delete_history_entry(session.undo_stack.pop(0))
+
+        if job.history_mode == "snapshot" and job.history_snapshot_path is not None:
+            size = job.history_snapshot_path.stat().st_size
+            session.undo_stack.append(
+                SessionHistoryEntry(
+                    id=uuid.uuid4().hex,
+                    kind="snapshot",
+                    size_bytes=size,
+                    snapshot_path=job.history_snapshot_path,
+                    page_ids=list(job.history_before_page_ids or []),
+                    page_metadata=list(job.history_before_page_metadata or []),
+                )
+            )
+            job.history_snapshot_path = None
+        elif job.history_mode == "inverse":
+            before_ids = job.history_before_page_ids or []
+            if job.operation == "editor_rotate":
+                page = int(job.payload["page"])
+                if 0 <= page < len(before_ids):
+                    page_id = before_ids[page]
+                    angle = int(job.payload["angle"]) % 360
+                    session.undo_stack.append(
+                        SessionHistoryEntry(
+                            id=uuid.uuid4().hex,
+                            kind="inverse",
+                            undo_action={"kind": "rotate", "pageId": page_id, "angle": (-angle) % 360},
+                            redo_action={"kind": "rotate", "pageId": page_id, "angle": angle},
+                        )
+                    )
+            elif job.operation == "editor_move":
+                source, target = int(job.payload["from"]), int(job.payload["to"])
+                if 0 <= source < len(before_ids):
+                    page_id = before_ids[source]
+                    session.undo_stack.append(
+                        SessionHistoryEntry(
+                            id=uuid.uuid4().hex,
+                            kind="inverse",
+                            undo_action={"kind": "move", "pageId": page_id, "targetIndex": source},
+                            redo_action={"kind": "move", "pageId": page_id, "targetIndex": target},
+                        )
+                    )
+        self._evict_history_until_bounded(session.undo_stack, [])
+
+    def _apply_history_transition(
+        self,
+        session,
+        job: JobRecord,
+        current_snapshot: Path | None,
+    ) -> None:
+        entry = job.history_entry
+        if entry is None or job.history_action not in {"undo", "redo"}:
+            return
+        source = session.undo_stack if job.history_action == "undo" else session.redo_stack
+        destination = session.redo_stack if job.history_action == "undo" else session.undo_stack
+        if not source or source[-1].id != entry.id:
+            raise PdfError(409, "撤销/重做历史已变化", code="HISTORY_CONFLICT")
+        source.pop()
+        if entry.kind == "snapshot":
+            self._delete_history_entry(entry)
+            if job.history_policy != "no_undo" and current_snapshot is not None:
+                destination.append(
+                    SessionHistoryEntry(
+                        id=uuid.uuid4().hex,
+                        kind="snapshot",
+                        size_bytes=current_snapshot.stat().st_size,
+                        snapshot_path=current_snapshot,
+                        page_ids=list(job.history_before_page_ids or []),
+                        page_metadata=list(job.history_before_page_metadata or []),
+                    )
+                )
+            elif current_snapshot is not None:
+                current_snapshot.unlink(missing_ok=True)
+        elif job.history_policy != "no_undo":
+            destination.append(entry)
+        self._evict_history_until_bounded(session.undo_stack, session.redo_stack)
+
+    @staticmethod
+    def _delete_history_entry(entry: SessionHistoryEntry) -> None:
+        if entry.snapshot_path is not None:
+            try:
+                entry.snapshot_path.unlink(missing_ok=True)
+            except OSError:
+                logger.exception("Could not remove history snapshot %s", entry.snapshot_path)
+
+    def _clear_history_stack(self, stack: list[SessionHistoryEntry]) -> None:
+        for entry in stack:
+            self._delete_history_entry(entry)
+        stack.clear()
+
+    def _evict_history_until_bounded(
+        self,
+        first: list[SessionHistoryEntry],
+        second: list[SessionHistoryEntry],
+    ) -> None:
+        def total_bytes() -> int:
+            return sum(entry.size_bytes for entry in first) + sum(entry.size_bytes for entry in second)
+
+        while len(first) + len(second) > config.EDITOR_HISTORY_MAX_STEPS or total_bytes() > config.EDITOR_HISTORY_MAX_BYTES:
+            if first:
+                self._delete_history_entry(first.pop(0))
+            elif second:
+                self._delete_history_entry(second.pop(0))
+            else:
+                break
 
     def _drain_progress(self, job: JobRecord, progress_queue) -> None:
         while True:
@@ -539,6 +881,7 @@ class JobManager:
         job.finished_at = time.time()
         if state in {"failed", "cancelled"}:
             shutil.rmtree(job.work_dir, ignore_errors=True)
+            self._discard_pending_history_snapshot(job)
             if job.cleanup_session_on_failure and job.session_id:
                 session_manager.close(job.session_id)
                 job.cleanup_session_on_failure = False

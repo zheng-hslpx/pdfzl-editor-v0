@@ -36,6 +36,7 @@ from ..schemas import (
     AddTextRequest,
     ApplyEditsRequest,
     DeletePagesRequest,
+    HistoryActionRequest,
     MovePageRequest,
     RotatePageRequest,
 )
@@ -210,6 +211,166 @@ def _preflight_edits(session, payload: ApplyEditsRequest) -> None:
             doc.close()
 
 
+@router.get("/{doc_id}/pages", summary="分页读取页面信息")
+async def get_pages(
+    doc_id: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=100),
+):
+    session = session_manager.get(doc_id)
+    with session.lock:
+        if session.pending_job_id is not None:
+            raise PdfError(409, "文档修改任务仍在执行", code="SESSION_BUSY")
+        metadata = session.page_metadata
+        if not metadata:
+            raise PdfError(409, "页面信息仍在准备", code="SESSION_BUSY")
+        return {
+            "docId": doc_id,
+            "revision": session.revision,
+            "pageCount": len(session.page_ids),
+            "offset": offset,
+            "limit": limit,
+            "pages": metadata[offset : offset + limit],
+        }
+
+
+@router.get("/{doc_id}/pages/{page_no}/text", summary="读取单页文本模型")
+async def get_page_text(doc_id: str, page_no: int):
+    session = session_manager.get(doc_id)
+    with session.lock:
+        if session.pending_job_id is not None:
+            raise PdfError(409, "文档修改任务仍在执行", code="SESSION_BUSY")
+        if page_no < 0 or page_no >= len(session.page_ids):
+            raise PdfError(404, "页面不存在")
+        doc = pdf_engine.open_pdf(session.path)
+        try:
+            page = extract_page_text_model(
+                doc, page_no, session.page_ids[page_no]
+            )
+        finally:
+            doc.close()
+        return {"docId": doc_id, "revision": session.revision, "page": page}
+
+
+@router.get("/{doc_id}/history", summary="查询撤销/重做状态")
+async def get_history(doc_id: str):
+    session = session_manager.get(doc_id)
+    with session.lock:
+        return {
+            "docId": doc_id,
+            "revision": session.revision,
+            "canUndo": bool(session.undo_stack),
+            "canRedo": bool(session.redo_stack),
+            "undoSteps": len(session.undo_stack),
+            "redoSteps": len(session.redo_stack),
+            "historyBytes": sum(entry.size_bytes for entry in session.undo_stack + session.redo_stack),
+            "maxSteps": 10,
+            "maxBytes": 1024 * 1024 * 1024,
+        }
+
+
+@router.get("/{doc_id}/history/plan", summary="检查历史容量")
+async def history_plan(doc_id: str, kind: str = Query(default="snapshot")):
+    if kind not in {"snapshot", "inverse", "undo", "redo"}:
+        raise PdfError(422, "历史记录类型无效", code="INVALID_HISTORY_MODE")
+    session = session_manager.get(doc_id)
+    with session.lock:
+        if session.pending_job_id is not None:
+            raise PdfError(409, "文档修改任务仍在执行", code="SESSION_BUSY")
+        if kind in {"undo", "redo"}:
+            return job_manager.history_transition_plan(session, kind)
+        return job_manager.history_plan(session, kind)
+
+
+async def _submit_history_action(
+    doc_id: str,
+    payload: HistoryActionRequest,
+    action: str,
+    idempotency_key: str,
+    history_policy: str,
+):
+    session = session_manager.get(doc_id)
+    with session.lock:
+        _ensure_session_writable(session, payload.expectedRevision)
+        source_stack = session.undo_stack if action == "undo" else session.redo_stack
+        if not source_stack:
+            raise PdfError(409, "没有可用的撤销/重做记录", code="HISTORY_EMPTY")
+        entry = source_stack[-1]
+        if entry.kind == "snapshot":
+            if entry.snapshot_path is None or not entry.snapshot_path.is_file():
+                raise PdfError(409, "历史快照已丢失", code="HISTORY_SNAPSHOT_MISSING")
+            operation = "editor_history_restore"
+            job_payload = {
+                "source_path": str(entry.snapshot_path),
+                "page_ids": list(entry.page_ids or []),
+            }
+        else:
+            inverse = entry.undo_action if action == "undo" else entry.redo_action
+            if not inverse:
+                raise PdfError(409, "历史操作记录无效", code="HISTORY_ENTRY_INVALID")
+            page_id = inverse.get("pageId")
+            try:
+                current_page = session.page_ids.index(page_id)
+            except ValueError as exc:
+                raise PdfError(409, "历史页面已变化", code="HISTORY_CONFLICT") from exc
+            if inverse["kind"] == "rotate":
+                operation = "editor_rotate"
+                job_payload = {
+                    "source_path": str(session.path),
+                    "page_ids": list(session.page_ids),
+                    "page": current_page,
+                    "angle": int(inverse["angle"]),
+                }
+            elif inverse["kind"] == "move":
+                operation = "editor_move"
+                job_payload = {
+                    "source_path": str(session.path),
+                    "page_ids": list(session.page_ids),
+                    "from": current_page,
+                    "to": int(inverse["targetIndex"]),
+                }
+            else:
+                raise PdfError(409, "历史操作类型不受支持", code="HISTORY_ENTRY_INVALID")
+
+    request_hash = job_manager.fingerprint(
+        operation,
+        {**job_payload, "docId": doc_id, "expectedRevision": payload.expectedRevision, "historyAction": action},
+        [entry.id],
+    )
+    job = await job_manager.submit(
+        operation,
+        job_payload,
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
+        session_id=doc_id,
+        expected_revision=payload.expectedRevision,
+        history_action=action,
+        history_entry=entry,
+        history_policy=history_policy or None,
+    )
+    return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
+
+
+@router.post("/{doc_id}/history/undo", summary="撤销")
+async def undo(
+    doc_id: str,
+    payload: HistoryActionRequest,
+    idempotency_key: str = Header(alias="Idempotency-Key"),
+    history_policy: str = Header(default="", alias="History-Policy"),
+):
+    return await _submit_history_action(doc_id, payload, "undo", idempotency_key, history_policy)
+
+
+@router.post("/{doc_id}/history/redo", summary="重做")
+async def redo(
+    doc_id: str,
+    payload: HistoryActionRequest,
+    idempotency_key: str = Header(alias="Idempotency-Key"),
+    history_policy: str = Header(default="", alias="History-Policy"),
+):
+    return await _submit_history_action(doc_id, payload, "redo", idempotency_key, history_policy)
+
+
 # ---------------------------------------------------------------------------
 # endpoints
 # ---------------------------------------------------------------------------
@@ -260,6 +421,7 @@ async def apply_edits(
     doc_id: str,
     payload: ApplyEditsRequest,
     idempotency_key: str = Header(alias="Idempotency-Key"),
+    history_policy: str = Header(default="", alias="History-Policy"),
 ):
     session = session_manager.get(doc_id)
     _preflight_edits(session, payload)
@@ -275,6 +437,7 @@ async def apply_edits(
         request_hash=request_hash,
         session_id=doc_id,
         expected_revision=payload.expectedRevision,
+        history_policy=history_policy or None,
     )
     return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
 
@@ -284,6 +447,7 @@ async def add_text(
     doc_id: str,
     payload: AddTextRequest,
     idempotency_key: str = Header(alias="Idempotency-Key"),
+    history_policy: str = Header(default="", alias="History-Policy"),
 ):
     session = session_manager.get(doc_id)
     _preflight_page_write(
@@ -302,6 +466,7 @@ async def add_text(
         request_hash=request_hash,
         session_id=doc_id,
         expected_revision=payload.expectedRevision,
+        history_policy=history_policy or None,
     )
     return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
 
@@ -318,6 +483,7 @@ async def add_image(
     expectedRevision: int = Form(..., ge=0),
     pageId: str = Form(...),
     idempotency_key: str = Header(alias="Idempotency-Key"),
+    history_policy: str = Header(default="", alias="History-Policy"),
 ):
     if not all(math.isfinite(v) for v in (x, y, w, h)) or w <= 0 or h <= 0:
         raise PdfError(400, "图片尺寸必须为正数")
@@ -352,6 +518,7 @@ async def add_image(
             input_paths=[img_path],
             session_id=doc_id,
             expected_revision=expectedRevision,
+            history_policy=history_policy or None,
         )
         return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
     except BaseException:
@@ -364,6 +531,7 @@ async def rotate_page(
     doc_id: str,
     payload: RotatePageRequest,
     idempotency_key: str = Header(alias="Idempotency-Key"),
+    history_policy: str = Header(default="", alias="History-Policy"),
 ):
     page_no, angle = payload.page, payload.angle
     if angle not in (90, 180, 270):
@@ -382,6 +550,7 @@ async def rotate_page(
         "editor_rotate", payload_dict, idempotency_key=idempotency_key,
         request_hash=request_hash, session_id=doc_id,
         expected_revision=payload.expectedRevision,
+        history_policy=history_policy or None,
     )
     return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
 
@@ -391,6 +560,7 @@ async def delete_pages(
     doc_id: str,
     payload: DeletePagesRequest,
     idempotency_key: str = Header(alias="Idempotency-Key"),
+    history_policy: str = Header(default="", alias="History-Policy"),
 ):
     pages = payload.pages
     session = session_manager.get(doc_id)
@@ -406,6 +576,7 @@ async def delete_pages(
         "editor_delete", payload_dict, idempotency_key=idempotency_key,
         request_hash=request_hash, session_id=doc_id,
         expected_revision=payload.expectedRevision,
+        history_policy=history_policy or None,
     )
     return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
 
@@ -415,6 +586,7 @@ async def move_page(
     doc_id: str,
     payload: MovePageRequest,
     idempotency_key: str = Header(alias="Idempotency-Key"),
+    history_policy: str = Header(default="", alias="History-Policy"),
 ):
     src, dst = payload.fromPage, payload.toPage
     session = session_manager.get(doc_id)
@@ -431,6 +603,7 @@ async def move_page(
         "editor_move", payload_dict, idempotency_key=idempotency_key,
         request_hash=request_hash, session_id=doc_id,
         expected_revision=payload.expectedRevision,
+        history_policy=history_policy or None,
     )
     return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
 

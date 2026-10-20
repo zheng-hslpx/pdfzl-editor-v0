@@ -61,7 +61,7 @@ export default function PageNumbersTool() {
           />
         </div>
       }
-      execute={async (managed) => {
+      execute={async (managed, jobOptions) => {
         const form = new FormData();
         form.append("fileInput", managed[0]!.file, managed[0]!.name);
         form.append("position", position);
@@ -69,7 +69,7 @@ export default function PageNumbersTool() {
         form.append("fontSize", String(fontSize));
         form.append("margin", String(margin));
         form.append("pages", pages);
-        return postFiles("/misc/add-page-numbers", form);
+        return postFiles("/misc/add-page-numbers", form, jobOptions);
       }}
     />
   );

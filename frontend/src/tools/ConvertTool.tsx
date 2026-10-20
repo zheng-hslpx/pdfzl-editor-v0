@@ -88,7 +88,7 @@ export default function ConvertTool() {
           )}
         </div>
       }
-      execute={async (managed) => {
+      execute={async (managed, jobOptions) => {
         const form = new FormData();
         if (meta.multi) {
           managed.forEach((f) => form.append("fileInput", f.file, f.name));
@@ -100,16 +100,16 @@ export default function ConvertTool() {
             form.append("format", imageFormat);
             form.append("dpi", String(dpi));
             form.append("pages", pages);
-            return postFiles("/convert/pdf-to-image", form);
+            return postFiles("/convert/pdf-to-image", form, jobOptions);
           case "pdf-to-text":
-            return postFiles("/convert/pdf-to-text", form);
+            return postFiles("/convert/pdf-to-text", form, jobOptions);
           case "pdf-to-word":
-            return postFiles("/convert/pdf-to-word", form);
+            return postFiles("/convert/pdf-to-word", form, jobOptions);
           case "image-to-pdf":
             form.append("pageSize", pageSize);
-            return postFiles("/convert/image-to-pdf", form);
+            return postFiles("/convert/image-to-pdf", form, jobOptions);
           case "office-to-pdf":
-            return postFiles("/convert/office-to-pdf", form);
+            return postFiles("/convert/office-to-pdf", form, jobOptions);
         }
       }}
     />

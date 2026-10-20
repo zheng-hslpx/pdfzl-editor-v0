@@ -16,7 +16,12 @@ def _open(client, pdf_path, name="sample.pdf"):
         files=[("fileInput", (name, pdf_path.read_bytes(), "application/pdf"))],
     )
     assert result["state"] == "succeeded", result.get("error")
-    return result["result"]
+    data = result["result"]
+    data["textModel"] = [
+        client.get(f"/api/v1/edit/{data['docId']}/pages/{page['page']}/text").json()["page"]
+        for page in data["pages"]
+    ]
+    return data
 
 
 def _find_line(model: dict, page: int, needle: str) -> dict:
@@ -45,14 +50,123 @@ def _download(client, doc_id: str) -> fitz.Document:
     return fitz.open(stream=r.content, filetype="pdf")
 
 
-def test_open_returns_text_model(client, sample_pdf):
-    data = _open(client, sample_pdf)
+def test_open_returns_light_pages_and_paged_text_api(client, sample_pdf):
+    accepted, _ = submit_job(
+        client,
+        "/api/v1/edit/open",
+        files=[("fileInput", ("sample.pdf", sample_pdf.read_bytes(), "application/pdf"))],
+    )
+    assert accepted["state"] == "succeeded"
+    data = accepted["result"]
+    assert "textModel" not in data
     assert data["pageCount"] == 3
     assert data["pages"][0]["width"] == 595
-    line = _find_line(data["textModel"], 0, "PAGE-1")
+    page_slice = client.get(
+        f"/api/v1/edit/{data['docId']}/pages", params={"offset": 1, "limit": 1}
+    )
+    assert page_slice.status_code == 200
+    assert page_slice.json()["pages"][0]["page"] == 1
+    page_response = client.get(f"/api/v1/edit/{data['docId']}/pages/0/text")
+    assert page_response.status_code == 200
+    assert page_response.json()["revision"] == data["revision"]
+    line = _find_line([page_response.json()["page"]], 0, "PAGE-1")
     assert line["bbox"][2] > line["bbox"][0]
     assert line["fontSize"] > 0
     assert line["font"] == "helv"
+
+
+def test_large_editor_open_paginates_metadata_without_a_page_cap(client, tmp_path):
+    source_path = tmp_path / "one-hundred-five-pages.pdf"
+    source = fitz.open()
+    for index in range(105):
+        page = source.new_page(width=595, height=842)
+        page.insert_text((72, 100), f"PAGE-{index + 1}")
+    source.save(source_path)
+    source.close()
+
+    opened, _ = submit_job(
+        client,
+        "/api/v1/edit/open",
+        files=[("fileInput", (source_path.name, source_path.read_bytes(), "application/pdf"))],
+    )
+    assert opened["state"] == "succeeded", opened.get("error")
+    data = opened["result"]
+    assert data["pageCount"] == 105
+    assert len(data["pages"]) == 50
+    assert "textModel" not in data
+
+    second_slice = client.get(
+        f"/api/v1/edit/{data['docId']}/pages", params={"offset": 50, "limit": 50}
+    ).json()
+    final_slice = client.get(
+        f"/api/v1/edit/{data['docId']}/pages", params={"offset": 100, "limit": 50}
+    ).json()
+    assert [len(second_slice["pages"]), len(final_slice["pages"])] == [50, 5]
+    last_page = client.get(f"/api/v1/edit/{data['docId']}/pages/104/text").json()
+    assert last_page["page"]["pageId"] == final_slice["pages"][-1]["pageId"]
+    assert any("PAGE-105" in line["text"] for line in last_page["page"]["lines"])
+
+
+def test_undo_redo_uses_inverse_records_and_server_snapshots(client, sample_pdf):
+    data = _open(client, sample_pdf)
+    doc_id = data["docId"]
+
+    rotated, _ = submit_job(
+        client,
+        f"/api/v1/edit/{doc_id}/pages/rotate",
+        json={"page": 0, "angle": 90, "expectedRevision": data["revision"]},
+    )
+    assert rotated["state"] == "succeeded"
+    assert client.get(f"/api/v1/edit/{doc_id}/history").json()["undoSteps"] == 1
+    assert client.get(f"/api/v1/edit/{doc_id}/history").json()["historyBytes"] == 0
+
+    undone_rotation, _ = submit_job(
+        client,
+        f"/api/v1/edit/{doc_id}/history/undo",
+        json={"expectedRevision": rotated["result"]["revision"]},
+    )
+    assert undone_rotation["state"] == "succeeded"
+    current = _download(client, doc_id)
+    assert current[0].rotation == 0
+    current.close()
+    assert client.get(f"/api/v1/edit/{doc_id}/history").json()["canRedo"] is True
+
+    redone_rotation, _ = submit_job(
+        client,
+        f"/api/v1/edit/{doc_id}/history/redo",
+        json={"expectedRevision": undone_rotation["result"]["revision"]},
+    )
+    assert redone_rotation["state"] == "succeeded"
+    current = _download(client, doc_id)
+    assert current[0].rotation == 90
+    current.close()
+
+    deleted, _ = submit_job(
+        client,
+        f"/api/v1/edit/{doc_id}/pages/delete",
+        json={"pages": [1], "expectedRevision": redone_rotation["result"]["revision"]},
+    )
+    assert deleted["state"] == "succeeded"
+    history = client.get(f"/api/v1/edit/{doc_id}/history").json()
+    assert history["historyBytes"] > 0
+    restored, _ = submit_job(
+        client,
+        f"/api/v1/edit/{doc_id}/history/undo",
+        json={"expectedRevision": deleted["result"]["revision"]},
+    )
+    assert restored["state"] == "succeeded"
+    current = _download(client, doc_id)
+    assert current.page_count == 3
+    current.close()
+    redeleted, _ = submit_job(
+        client,
+        f"/api/v1/edit/{doc_id}/history/redo",
+        json={"expectedRevision": restored["result"]["revision"]},
+    )
+    assert redeleted["state"] == "succeeded"
+    current = _download(client, doc_id)
+    assert current.page_count == 2
+    current.close()
 
 
 def test_editor_commit_preserves_links_forms_bookmarks_and_metadata(client, tmp_path):

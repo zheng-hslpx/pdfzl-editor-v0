@@ -161,12 +161,6 @@ def _page_metadata(doc: fitz.Document, page_ids: list[str]) -> list[dict]:
     ]
 
 
-def _editor_model(doc: fitz.Document, page_ids: list[str]) -> list[dict]:
-    from ..routers.edit import extract_text_model
-
-    return extract_text_model(doc, page_ids)
-
-
 def _parse_segments(spec: str, total: int) -> list[tuple[list[int], str]]:
     spec = (spec or "").strip()
     if not spec:
@@ -252,6 +246,7 @@ def _run_operation(operation: str, payload: dict[str, Any], work_dir: Path,
         doc = _read_pdf(payload["source_path"])
         try:
             page_ids = payload["page_ids"]
+            page_metadata = _page_metadata(doc, page_ids)
             return {
                 "kind": "json",
                 "data": {
@@ -259,20 +254,43 @@ def _run_operation(operation: str, payload: dict[str, Any], work_dir: Path,
                     "originalName": payload["originalName"],
                     "pageCount": doc.page_count,
                     "revision": payload.get("revision", 0),
-                    "pages": _page_metadata(doc, page_ids),
-                    "textModel": _editor_model(doc, page_ids),
+                    "pages": page_metadata[:50],
+                    "_allPageMetadata": page_metadata,
                 },
             }
         finally:
             doc.close()
 
+    if operation == "editor_history_restore":
+        source = Path(payload["source_path"])
+        doc = _read_pdf(str(source))
+        page_ids = list(payload["page_ids"])
+        try:
+            _check_cancel(cancel_event)
+            data = {
+                "pageCount": doc.page_count,
+                "pageIds": page_ids,
+                "pages": _page_metadata(doc, page_ids),
+                "changedPageIds": page_ids,
+                "removedPageIds": [],
+            }
+        finally:
+            doc.close()
+        destination = output.with_suffix(".pdf")
+        shutil.copy2(source, destination)
+        return {"kind": "session_mutation", "artifact": destination.name, "data": data}
+
     if operation.startswith("editor_"):
         doc = _read_pdf(payload["source_path"])
         page_ids = list(payload["page_ids"])
+        changed_page_ids: set[str] = set()
+        removed_page_ids: list[str] = []
         try:
             _check_cancel(cancel_event)
             if operation == "editor_apply":
                 for edit in payload["edits"]:
+                    if edit.get("pageId"):
+                        changed_page_ids.add(edit["pageId"])
                     page = _validate_anchor(doc, page_ids, edit)
                     bbox = fitz.Rect(edit["bbox"])
                     if not page.rect.contains(bbox):
@@ -305,6 +323,7 @@ def _run_operation(operation: str, payload: dict[str, Any], work_dir: Path,
                             fontname=font, fontsize=6,
                         )
             elif operation == "editor_add_text":
+                changed_page_ids.add(payload["pageId"])
                 page = _validate_anchor(
                     doc, page_ids,
                     {"page": payload["page"], "pageId": payload["pageId"], "kind": "cover"},
@@ -317,6 +336,7 @@ def _run_operation(operation: str, payload: dict[str, Any], work_dir: Path,
                     color=_parse_color(payload.get("color", "#000000")),
                 )
             elif operation == "editor_add_image":
+                changed_page_ids.add(payload["pageId"])
                 page = _validate_anchor(
                     doc, page_ids,
                     {"page": payload["page"], "pageId": payload["pageId"], "kind": "cover"},
@@ -343,6 +363,7 @@ def _run_operation(operation: str, payload: dict[str, Any], work_dir: Path,
                     raise PdfError(400, "页码越界")
                 if len(indices) >= doc.page_count:
                     raise PdfError(400, "不能删除全部页面")
+                removed_page_ids = [page_ids[index] for index in indices]
                 doc.delete_pages(indices)
                 removed = set(indices)
                 page_ids = [page_id for index, page_id in enumerate(page_ids) if index not in removed]
@@ -370,7 +391,8 @@ def _run_operation(operation: str, payload: dict[str, Any], work_dir: Path,
                     "pageCount": result_doc.page_count,
                     "pageIds": page_ids,
                     "pages": _page_metadata(result_doc, page_ids),
-                    "textModel": _editor_model(result_doc, page_ids),
+                    "changedPageIds": sorted(changed_page_ids),
+                    "removedPageIds": removed_page_ids,
                 }
             finally:
                 result_doc.close()

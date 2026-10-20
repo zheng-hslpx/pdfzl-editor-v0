@@ -12,12 +12,26 @@ import os
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from .. import config
 from ..core.errors import PdfError
 
 logger = logging.getLogger("pdf_editor.sessions")
+
+
+@dataclass
+class SessionHistoryEntry:
+    id: str
+    kind: Literal["snapshot", "inverse"]
+    size_bytes: int = 0
+    snapshot_path: Path | None = None
+    page_ids: list[str] | None = None
+    page_metadata: list[dict] | None = None
+    undo_action: dict | None = None
+    redo_action: dict | None = None
 
 
 class EditSession:
@@ -29,9 +43,12 @@ class EditSession:
         self.last_active_at = self.created_at
         self.revision = 0
         self.page_ids = [uuid.uuid4().hex for _ in range(page_count)]
+        self.page_metadata: list[dict] = []
         self.lock = threading.RLock()
         self.pending_job_id: str | None = None
         self.closed = False
+        self.undo_stack: list[SessionHistoryEntry] = []
+        self.redo_stack: list[SessionHistoryEntry] = []
 
     def touch(self) -> None:
         self.last_active_at = time.time()

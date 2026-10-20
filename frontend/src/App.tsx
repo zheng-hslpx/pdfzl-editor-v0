@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { BrowserRouter, Link, Route, Routes } from "react-router-dom";
 import { AppShell, Badge, Burger, Group, Text, Title } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { FileProvider } from "./contexts/FileContext";
@@ -44,16 +44,16 @@ function Shell() {
           导航
         </Text>
         <Text
-          component="a"
-          href="/"
+          component={Link}
+          to="/"
           size="sm"
           style={{ display: "block", marginBottom: 8, textDecoration: "none" }}
         >
           全部工具
         </Text>
         <Text
-          component="a"
-          href="/editor"
+          component={Link}
+          to="/editor"
           size="sm"
           style={{ display: "block", textDecoration: "none" }}
         >

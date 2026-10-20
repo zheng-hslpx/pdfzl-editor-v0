@@ -33,12 +33,12 @@ export default function RotateTool() {
           />
         </div>
       }
-      execute={async (managed) => {
+      execute={async (managed, jobOptions) => {
         const form = new FormData();
         form.append("fileInput", managed[0]!.file, managed[0]!.name);
         form.append("angle", angle ?? "90");
         form.append("pages", pages);
-        return postFiles("/general/rotate", form);
+        return postFiles("/general/rotate", form, jobOptions);
       }}
     />
   );

@@ -18,10 +18,10 @@ export default function MergeTool() {
           合并顺序即文件列表顺序（可在上一步用 ↑ ↓ 调整）。合并时会保留各文件的书签目录（TOC）。
         </Text>
       }
-      execute={async (managed) => {
+      execute={async (managed, jobOptions) => {
         const form = new FormData();
         managed.forEach((f) => form.append("fileInput", f.file, f.name));
-        return postFiles("/general/merge-pdfs", form);
+        return postFiles("/general/merge-pdfs", form, jobOptions);
       }}
     />
   );

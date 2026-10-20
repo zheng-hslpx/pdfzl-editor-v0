@@ -55,7 +55,7 @@ export default function WatermarkTool() {
           />
         </div>
       }
-      execute={async (managed) => {
+      execute={async (managed, jobOptions) => {
         const form = new FormData();
         form.append("fileInput", managed[0]!.file, managed[0]!.name);
         form.append("text", text);
@@ -63,7 +63,7 @@ export default function WatermarkTool() {
         form.append("rotation", String(rotation));
         form.append("fontSize", String(fontSize));
         form.append("color", color);
-        return postFiles("/misc/watermark", form);
+        return postFiles("/misc/watermark", form, jobOptions);
       }}
     />
   );

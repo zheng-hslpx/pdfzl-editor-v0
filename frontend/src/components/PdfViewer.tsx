@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { Alert, Loader } from "@mantine/core";
+import { Alert, Loader, Text } from "@mantine/core";
 
 type PdfjsModule = typeof import("pdfjs-dist");
+type PdfDocument = Awaited<ReturnType<PdfjsModule["getDocument"]>["promise"]>;
 
 let pdfjsPromise: Promise<PdfjsModule> | null = null;
 
@@ -23,58 +24,34 @@ export interface PdfViewerProps {
   onPageCount?: (count: number) => void;
 }
 
-/**
- * Minimal pdf.js viewer: renders every page as a canvas into a scroll
- * container. The editor (M5) extends this with a positioned text overlay.
- */
+/** PDF.js preview that holds canvases only for visible pages and their neighbors. */
 export function PdfViewer({ data, scale = 1.2, onPageCount }: PdfViewerProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
+  const [pdfDoc, setPdfDoc] = useState<PdfDocument | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    let doc: { destroy: () => void } | null = null;
+    let doc: PdfDocument | null = null;
+    setLoading(true);
+    setError(null);
+    setPdfDoc(null);
 
-    (async () => {
+    void (async () => {
       try {
         const pdfjs = await loadPdfjs();
-        const pdfDoc = await pdfjs.getDocument({ data }).promise;
+        const loaded = await pdfjs.getDocument({ data }).promise;
         if (cancelled) {
-          pdfDoc.destroy();
+          await loaded.destroy();
           return;
         }
-        doc = pdfDoc;
-        const container = containerRef.current;
-        if (!container) return;
-        container.textContent = "";
-        onPageCount?.(pdfDoc.numPages);
+        doc = loaded;
+        setPdfDoc(loaded);
+        onPageCount?.(loaded.numPages);
         setLoading(false);
-
-        for (let pageNo = 1; pageNo <= pdfDoc.numPages; pageNo++) {
-          if (cancelled) return;
-          const page = await pdfDoc.getPage(pageNo);
-          const viewport = page.getViewport({ scale });
-          const wrapper = document.createElement("div");
-          wrapper.style.position = "relative";
-          wrapper.style.marginBottom = "16px";
-          wrapper.style.boxShadow = "0 0 6px rgba(0,0,0,0.25)";
-          wrapper.style.width = "fit-content";
-          const canvas = document.createElement("canvas");
-          canvas.width = Math.floor(viewport.width);
-          canvas.height = Math.floor(viewport.height);
-          canvas.style.display = "block";
-          wrapper.appendChild(canvas);
-          container.appendChild(wrapper);
-          const ctx = canvas.getContext("2d");
-          if (ctx) {
-            await page.render({ canvas, canvasContext: ctx, viewport }).promise;
-          }
-          page.cleanup();
-        }
-      } catch (e) {
+      } catch (reason) {
         if (!cancelled) {
-          setError(String(e));
+          setError(String(reason));
           setLoading(false);
         }
       }
@@ -82,22 +59,130 @@ export function PdfViewer({ data, scale = 1.2, onPageCount }: PdfViewerProps) {
 
     return () => {
       cancelled = true;
-      doc?.destroy();
+      void doc?.destroy();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data, scale]);
+  }, [data, onPageCount]);
 
-  if (error) {
-    return <Alert color="red" title="无法渲染 PDF">{error}</Alert>;
-  }
+  if (error) return <Alert color="red" title="无法渲染 PDF">{error}</Alert>;
+  if (loading || !pdfDoc) return <Loader size="sm" />;
 
   return (
-    <div style={{ position: "relative" }}>
-      {loading && <Loader size="sm" />}
-      <div
-        ref={containerRef}
-        style={{ display: loading ? "none" : "block", overflowX: "auto" }}
+    <div style={{ display: "grid", justifyItems: "center", gap: 16 }}>
+      {Array.from({ length: pdfDoc.numPages }, (_, index) => (
+        <PdfPreviewPage key={index} pdfDoc={pdfDoc} pageNo={index + 1} scale={scale} />
+      ))}
+    </div>
+  );
+}
+
+function PdfPreviewPage({
+  pdfDoc,
+  pageNo,
+  scale,
+}: {
+  pdfDoc: PdfDocument;
+  pageNo: number;
+  scale: number;
+}) {
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [nearViewport, setNearViewport] = useState(false);
+  const [rendered, setRendered] = useState(false);
+  const [limited, setLimited] = useState(false);
+
+  useEffect(() => {
+    const node = wrapperRef.current;
+    if (!node) return;
+    if (!("IntersectionObserver" in window)) {
+      setNearViewport(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      ([entry]) => setNearViewport(entry?.isIntersecting ?? false),
+      { rootMargin: "900px 0px" },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!nearViewport || !canvasRef.current) {
+      setRendered(false);
+      const canvas = canvasRef.current;
+      if (canvas) {
+        canvas.width = 0;
+        canvas.height = 0;
+      }
+      return;
+    }
+    let cancelled = false;
+    let renderTask: { promise: Promise<void>; cancel: () => void } | null = null;
+    void (async () => {
+      const page = await pdfDoc.getPage(pageNo);
+      if (cancelled) {
+        page.cleanup();
+        return;
+      }
+      const dpr = window.devicePixelRatio || 1;
+      let renderScale = scale * dpr;
+      const baseViewport = page.getViewport({ scale: renderScale });
+      const pixels = baseViewport.width * baseViewport.height;
+      if (pixels > 24_000_000) {
+        renderScale *= Math.sqrt(24_000_000 / pixels);
+        setLimited(true);
+      } else {
+        setLimited(false);
+      }
+      const viewport = page.getViewport({ scale: renderScale });
+      const canvas = canvasRef.current;
+      if (!canvas) {
+        page.cleanup();
+        return;
+      }
+      canvas.width = Math.ceil(viewport.width);
+      canvas.height = Math.ceil(viewport.height);
+      const context = canvas.getContext("2d");
+      if (context) {
+        renderTask = page.render({ canvas, canvasContext: context, viewport });
+        await renderTask.promise;
+      }
+      page.cleanup();
+      if (!cancelled) setRendered(true);
+    })().catch((reason) => {
+      if (!cancelled) console.error("PDF preview page render failed", pageNo, reason);
+    });
+    return () => {
+      cancelled = true;
+      renderTask?.cancel();
+    };
+  }, [nearViewport, pageNo, pdfDoc, scale]);
+
+  return (
+    <div
+      ref={wrapperRef}
+      style={{
+        position: "relative",
+        width: "min(100%, 900px)",
+        minHeight: Math.max(240, 842 * scale),
+        boxShadow: "0 0 6px rgba(0,0,0,0.18)",
+        background: "white",
+      }}
+    >
+      <canvas
+        ref={canvasRef}
+        style={{
+          display: rendered ? "block" : "none",
+          width: "100%",
+          height: "auto",
+        }}
       />
+      {!rendered && nearViewport && <Loader size="sm" />}
+      {limited && rendered && (
+        <Text size="xs" c="dimmed" style={{ position: "absolute", right: 8, bottom: 4 }}>
+          已降低预览分辨率以控制内存
+        </Text>
+      )}
+      <Text size="xs" c="dimmed" ta="center">第 {pageNo} 页</Text>
     </div>
   );
 }

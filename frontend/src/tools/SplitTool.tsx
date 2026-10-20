@@ -25,11 +25,11 @@ export default function SplitTool() {
           onChange={(e) => setRanges(e.currentTarget.value)}
         />
       }
-      execute={async (managed) => {
+      execute={async (managed, jobOptions) => {
         const form = new FormData();
         form.append("fileInput", managed[0]!.file, managed[0]!.name);
         form.append("pageRanges", ranges);
-        return postFiles("/general/split-pages", form);
+        return postFiles("/general/split-pages", form, jobOptions);
       }}
     />
   );

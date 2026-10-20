@@ -84,7 +84,7 @@ app.add_middleware(
     allow_origins=config.CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Idempotency-Key"],
+    allow_headers=["Content-Type", "Idempotency-Key", "History-Policy"],
 )
 app.add_middleware(LocalAccessMiddleware, ui_origin=config.UI_ORIGIN)
 app.add_middleware(RequestBodyLimitMiddleware, max_bytes=config.MAX_UPLOAD_BYTES)

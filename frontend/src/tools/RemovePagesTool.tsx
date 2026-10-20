@@ -26,11 +26,11 @@ export default function RemovePagesTool() {
           </Text>
         </div>
       }
-      execute={async (managed) => {
+      execute={async (managed, jobOptions) => {
         const form = new FormData();
         form.append("fileInput", managed[0]!.file, managed[0]!.name);
         form.append("pages", pages);
-        return postFiles("/general/remove-pages", form);
+        return postFiles("/general/remove-pages", form, jobOptions);
       }}
     />
   );

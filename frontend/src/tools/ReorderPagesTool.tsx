@@ -26,11 +26,11 @@ export default function ReorderPagesTool() {
           </Text>
         </div>
       }
-      execute={async (managed) => {
+      execute={async (managed, jobOptions) => {
         const form = new FormData();
         form.append("fileInput", managed[0]!.file, managed[0]!.name);
         form.append("pageOrder", pageOrder);
-        return postFiles("/general/reorder-pages", form);
+        return postFiles("/general/reorder-pages", form, jobOptions);
       }}
     />
   );

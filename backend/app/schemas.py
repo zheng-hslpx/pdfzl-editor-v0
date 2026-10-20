@@ -73,3 +73,7 @@ class MovePageRequest(BaseModel):
     expectedRevision: int = Field(ge=0)
     fromPage: int = Field(alias="from", ge=0)
     toPage: int = Field(alias="to", ge=0)
+
+
+class HistoryActionRequest(BaseModel):
+    expectedRevision: int = Field(ge=0)

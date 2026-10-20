@@ -256,3 +256,70 @@ def test_cancel_after_commit_point_is_rejected_and_commit_finishes(sample_pdf):
             await manager.stop()
 
     asyncio.run(scenario())
+
+
+def test_history_capacity_requires_explicit_evict_or_no_undo_policy(sample_pdf, monkeypatch):
+    from app import config
+
+    monkeypatch.setattr(config, "EDITOR_HISTORY_MAX_STEPS", 1)
+
+    async def scenario():
+        manager = JobManager()
+        await manager.start()
+        session = session_manager.create(sample_pdf, "sample.pdf", page_count=3)
+        try:
+            first = await manager.submit(
+                "editor_rotate",
+                {"source_path": str(session.path), "page_ids": list(session.page_ids), "page": 0, "angle": 90},
+                idempotency_key="history-step-1",
+                request_hash="history-step-1",
+                session_id=session.id,
+                expected_revision=0,
+            )
+            await _wait_terminal(first)
+            assert first.state == "succeeded"
+            original_entry = session.undo_stack[-1].id
+
+            with pytest.raises(PdfError) as full:
+                await manager.submit(
+                    "editor_rotate",
+                    {"source_path": str(session.path), "page_ids": list(session.page_ids), "page": 0, "angle": 90},
+                    idempotency_key="history-step-2-blocked",
+                    request_hash="history-step-2",
+                    session_id=session.id,
+                    expected_revision=1,
+                )
+            assert full.value.code == "HISTORY_CAPACITY_CONFIRMATION_REQUIRED"
+
+            second = await manager.submit(
+                "editor_rotate",
+                {"source_path": str(session.path), "page_ids": list(session.page_ids), "page": 0, "angle": 90},
+                idempotency_key="history-step-2-evict",
+                request_hash="history-step-2",
+                session_id=session.id,
+                expected_revision=1,
+                history_policy="evict_oldest",
+            )
+            await _wait_terminal(second)
+            assert second.state == "succeeded"
+            assert len(session.undo_stack) == 1
+            assert session.undo_stack[0].id != original_entry
+
+            third = await manager.submit(
+                "editor_rotate",
+                {"source_path": str(session.path), "page_ids": list(session.page_ids), "page": 0, "angle": 90},
+                idempotency_key="history-step-3-no-undo",
+                request_hash="history-step-3",
+                session_id=session.id,
+                expected_revision=2,
+                history_policy="no_undo",
+            )
+            await _wait_terminal(third)
+            assert third.state == "succeeded"
+            assert session.undo_stack == []
+            assert session.redo_stack == []
+        finally:
+            session_manager.close(session.id)
+            await manager.stop()
+
+    asyncio.run(scenario())

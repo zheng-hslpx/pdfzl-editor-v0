@@ -17,8 +17,16 @@ export function loadPdfjs(): Promise<PdfjsModule> {
 }
 
 export async function openPdfDocument(
-  data: Uint8Array,
+  source: Uint8Array | string,
 ): Promise<PDFDocumentProxy> {
   const pdfjs = await loadPdfjs();
-  return pdfjs.getDocument({ data }).promise;
+  if (typeof source === "string") {
+    return pdfjs.getDocument({
+      url: source,
+      disableStream: true,
+      disableAutoFetch: true,
+      rangeChunkSize: 64 * 1024,
+    }).promise;
+  }
+  return pdfjs.getDocument({ data: source }).promise;
 }
