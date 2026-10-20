@@ -1,0 +1,126 @@
+name: v0.1 CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.lock
+      - name: Install locked development dependencies
+        run: python -m pip install -r backend/requirements-dev.lock
+      - name: Run backend tests
+        run: python -m pytest backend/tests -ra --junitxml=backend/pytest-linux.xml
+      - name: Create Python SBOM and audit report
+        if: always()
+        run: |
+          mkdir -p artifacts
+          set +e
+          pip-audit -r backend/requirements-dev.lock --disable-pip --no-deps --format=json --output artifacts/python-audit.json
+          audit_status=$?
+          cyclonedx-py environment --gather-license-texts --output-reproducible --output-file artifacts/python-sbom.json
+          sbom_status=$?
+          set -e
+          if [ "$audit_status" -ne 0 ]; then exit "$audit_status"; fi
+          exit "$sbom_status"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-linux-evidence
+          path: |
+            backend/pytest-linux.xml
+            artifacts/python-sbom.json
+            artifacts/python-audit.json
+
+  backend-windows-libreoffice:
+    runs-on: windows-2022
+    env:
+      PDF_EDITOR_SOFFICE: 'C:\Program Files\LibreOffice\program\soffice.exe'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.lock
+      - name: Install LibreOffice
+        shell: pwsh
+        run: |
+          choco install libreoffice-still --version=26.2.4 --yes --no-progress
+          if (-not (Test-Path $env:PDF_EDITOR_SOFFICE)) { throw "LibreOffice was not installed at $env:PDF_EDITOR_SOFFICE" }
+          & $env:PDF_EDITOR_SOFFICE --version
+      - name: Install locked development dependencies
+        run: python -m pip install -r backend/requirements-dev.lock
+      - name: Run backend tests with real LibreOffice
+        run: python -m pytest backend/tests -ra --junitxml=backend/pytest-windows.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-windows-libreoffice-evidence
+          path: backend/pytest-windows.xml
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.2"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements.lock
+      - name: Install Python runtime for browser tests
+        run: python -m pip install -r backend/requirements.lock
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+      - name: TypeScript, unit tests, and production build
+        working-directory: frontend
+        run: |
+          npx tsc --noEmit
+          npm test
+          npm run build
+      - name: Install Playwright Chromium
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+      - name: Run Playwright end-to-end tests
+        working-directory: frontend
+        run: npm run test:e2e
+      - name: Frontend dependency audit and SBOM
+        if: always()
+        working-directory: frontend
+        run: |
+          mkdir -p ../artifacts
+          set +e
+          npm audit --audit-level=moderate --json > ../artifacts/npm-audit.json
+          audit_status=$?
+          npm sbom --package-lock-only --sbom-format=cyclonedx --sbom-type=application > ../artifacts/frontend-sbom.json
+          sbom_status=$?
+          set -e
+          if [ "$audit_status" -ne 0 ]; then exit "$audit_status"; fi
+          exit "$sbom_status"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frontend-evidence
+          path: |
+            frontend/playwright-report/
+            frontend/test-results/
+            frontend/dist/
+            artifacts/npm-audit.json
+            artifacts/frontend-sbom.json

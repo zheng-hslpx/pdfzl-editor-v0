@@ -10,6 +10,9 @@ venv/
 node_modules/
 dist/
 dist-ssr/
+playwright-report/
+test-results/
+frontend/.playwright-tmp/
 
 # Logs & env
 *.log
@@ -20,6 +23,8 @@ dist-ssr/
 temp/
 saved/
 samples/out/
+/artifacts/
+backend/pytest-*.xml
 
 # OS
 .DS_Store

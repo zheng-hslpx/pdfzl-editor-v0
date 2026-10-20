@@ -1,5 +1,5 @@
 /** Shared pdf.js loader (used by PdfViewer and the editor). */
-import type { PDFDocumentProxy } from "pdfjs-dist";
+import type { PDFDocumentLoadingTask } from "pdfjs-dist";
 
 type PdfjsModule = typeof import("pdfjs-dist");
 
@@ -18,7 +18,7 @@ export function loadPdfjs(): Promise<PdfjsModule> {
 
 export async function openPdfDocument(
   source: Uint8Array | string,
-): Promise<PDFDocumentProxy> {
+): Promise<PDFDocumentLoadingTask> {
   const pdfjs = await loadPdfjs();
   if (typeof source === "string") {
     return pdfjs.getDocument({
@@ -26,7 +26,7 @@ export async function openPdfDocument(
       disableStream: true,
       disableAutoFetch: true,
       rangeChunkSize: 64 * 1024,
-    }).promise;
+    });
   }
-  return pdfjs.getDocument({ data: source }).promise;
+  return pdfjs.getDocument({ data: source });
 }

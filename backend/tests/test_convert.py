@@ -250,7 +250,7 @@ def test_image_to_pdf_rejects_pdf(client, sample_pdf):
 
 
 @pytest.mark.skipif(
-    not libreoffice.soffice_functional(), reason="LibreOffice not functional"
+    not libreoffice.soffice_available(), reason="LibreOffice executable not available"
 )
 def test_office_to_pdf(client, sample_docx):
     _, r = successful_job(client,

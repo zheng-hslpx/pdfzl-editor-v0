@@ -27,6 +27,7 @@ import {
   IconZoomOut,
 } from "@tabler/icons-react";
 import { useNavigate } from "react-router-dom";
+import type { PDFDocumentLoadingTask, PDFDocumentProxy } from "pdfjs-dist";
 import { openPdfDocument } from "../lib/pdfjs";
 import { formatSize, useFiles } from "../contexts/FileContext";
 import * as editorApi from "../api/editor";
@@ -111,7 +112,7 @@ export function EditorPage() {
   const pageInfoRequests = useRef(new Map<string, Promise<void>>());
   const visiblePages = useRef(new Set<number>());
   const [pdfReloadKey, setPdfReloadKey] = useState(0);
-  const [pdfDoc, setPdfDoc] = useState<Awaited<ReturnType<typeof openPdfDocument>> | null>(null);
+  const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null);
 
   // editing state
   const [scale, setScale] = useState(1.2);
@@ -657,19 +658,21 @@ export function EditorPage() {
       return;
     }
     let cancelled = false;
-    let doc: { destroy: () => void } | null = null;
+    let loadingTask: PDFDocumentLoadingTask | null = null;
     setPdfDoc(null);
-    openPdfDocument(`/api/v1/edit/${docId}/download`).then((d) => {
+    void openPdfDocument(`/api/v1/edit/${docId}/download`).then((task) => {
+      loadingTask = task;
       if (cancelled) {
-        d.destroy();
+        void task.destroy().catch(() => undefined);
         return;
       }
-      doc = d;
-      setPdfDoc(d);
-    });
+      void task.promise.then((doc) => {
+        if (!cancelled) setPdfDoc(doc);
+      }).catch(() => undefined);
+    }).catch(() => undefined);
     return () => {
       cancelled = true;
-      doc?.destroy();
+      if (loadingTask) void loadingTask.destroy().catch(() => undefined);
     };
   }, [docId, pdfReloadKey]);
 
@@ -1073,7 +1076,7 @@ export function EditorPage() {
       if (busy || (!dirty && !hasServerChanges)) return;
       if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
       const target = event.target instanceof Element ? event.target.closest<HTMLAnchorElement>("a[href]") : null;
-      if (!target || target.target === "_blank") return;
+      if (!target || target.target === "_blank" || target.hasAttribute("download")) return;
       const url = new URL(target.href, window.location.href);
       if (url.origin !== window.location.origin || url.href === window.location.href) return;
       event.preventDefault();

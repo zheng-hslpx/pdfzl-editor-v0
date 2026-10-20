@@ -108,7 +108,7 @@ export const TOOLS: ToolDef[] = [
   {
     id: "compress",
     name: "压缩 PDF",
-    desc: "三档压缩，清理冗余对象",
+    desc: "优化 PDF 对象；不对图片降采样",
     category: "extra",
     icon: IconFileZip,
     maxFiles: 1,

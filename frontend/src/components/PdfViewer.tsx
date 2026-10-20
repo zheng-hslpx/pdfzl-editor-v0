@@ -3,6 +3,7 @@ import { Alert, Loader, Text } from "@mantine/core";
 
 type PdfjsModule = typeof import("pdfjs-dist");
 type PdfDocument = Awaited<ReturnType<PdfjsModule["getDocument"]>["promise"]>;
+type PdfLoadingTask = ReturnType<PdfjsModule["getDocument"]>;
 
 let pdfjsPromise: Promise<PdfjsModule> | null = null;
 
@@ -32,7 +33,7 @@ export function PdfViewer({ data, scale = 1.2, onPageCount }: PdfViewerProps) {
 
   useEffect(() => {
     let cancelled = false;
-    let doc: PdfDocument | null = null;
+    let loadingTask: PdfLoadingTask | null = null;
     setLoading(true);
     setError(null);
     setPdfDoc(null);
@@ -40,12 +41,14 @@ export function PdfViewer({ data, scale = 1.2, onPageCount }: PdfViewerProps) {
     void (async () => {
       try {
         const pdfjs = await loadPdfjs();
-        const loaded = await pdfjs.getDocument({ data }).promise;
+        const task = pdfjs.getDocument({ data });
+        loadingTask = task;
         if (cancelled) {
-          await loaded.destroy();
+          await task.destroy();
           return;
         }
-        doc = loaded;
+        const loaded = await task.promise;
+        if (cancelled) return;
         setPdfDoc(loaded);
         onPageCount?.(loaded.numPages);
         setLoading(false);
@@ -59,7 +62,7 @@ export function PdfViewer({ data, scale = 1.2, onPageCount }: PdfViewerProps) {
 
     return () => {
       cancelled = true;
-      void doc?.destroy();
+      if (loadingTask) void loadingTask.destroy().catch(() => undefined);
     };
   }, [data, onPageCount]);
 

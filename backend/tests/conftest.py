@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -15,9 +16,8 @@ from PIL import Image
 # Keep application-created uploads/sessions separate from the developer's
 # backend/temp directory and remove this run's data when pytest exits.
 _PYTEST_TEMP_ROOT = (
-    Path(__file__).resolve().parents[1]
-    / ".pytest-temp"
-    / f"r{os.getpid():x}-{uuid.uuid4().hex[:8]}"
+    Path(tempfile.gettempdir())
+    / f"pdfed-{os.getpid():x}-{uuid.uuid4().hex[:6]}"
     / "app"
 )
 _PYTEST_TEMP_ROOT.mkdir(parents=True, exist_ok=True)

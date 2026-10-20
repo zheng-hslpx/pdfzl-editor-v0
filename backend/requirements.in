@@ -1,0 +1,8 @@
+# Runtime direct dependencies. Compile to requirements.txt with pip-tools.
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.32,<1.0
+python-multipart>=0.0.12
+PyMuPDF==1.27.2.3
+pdf2docx>=0.5.8
+python-docx>=1.1
+Pillow>=11.0

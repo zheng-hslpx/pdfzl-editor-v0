@@ -1,147 +1,102 @@
-# PDF Editor v0
+# PDF Editor v0.1
 
-轻量级自托管 PDF 编辑器，架构模式参考 [Stirling-PDF](https://github.com/Stirling-Tools/Stirling-PDF)（MIT）。
-数据全程本地处理，不上传外部服务。
+本机运行的单用户 PDF 工具。文档处理在本机完成，应用不会把文件上传到云服务。后端与 Vite 默认只监听 `127.0.0.1`，服务没有登录鉴权；请勿绑定到局域网或公网地址。
 
-## 功能（v0）
+v0.1 完成阶段 0、阶段 1 及对应 P0/P1/P2 工程整改。产品范围不含 OCR、表单、批注或真正的安全 redaction。当前工具注册表有 **11 个入口**；“格式转换”入口内含 5 种转换。
 
-| 分类 | 工具 |
+## 功能
+
+| 分类 | 能力 |
 |---|---|
-| 常用 | 合并 PDF（顺序可调 + 书签合并）、拆分 PDF（页码范围 → ZIP） |
-| 页面组织 | 旋转、删除页面、重排页面 |
-| 格式转换 | PDF → 图片（PNG/JPEG，36-600 DPI）、PDF → 文本、PDF → Word（best-effort）、图片 → PDF、Office → PDF（LibreOffice） |
-| 更多 | 压缩（三档）、文字水印（任意角度/透明度）、添加页码、文档信息 |
-| 编辑 | **可视化编辑器**：点击文本行直接修改、添加文字/图片、涂抹、旋转/删除/移动页面、查找高亮、保存 / 另存为 |
+| 文件组织 | 合并 PDF、拆分为 ZIP、旋转、删除和重排页面 |
+| 格式转换 | PDF→图片/文本/Word、图片→PDF、Office→PDF |
+| 其他工具 | PDF 对象优化、水印、页码、文档信息 |
+| 可视化编辑器 | 修改文本行、添加文字/图片、视觉遮挡、旋转/删除/移动页面、查找、高亮、保存/另存为、撤销/重做 |
+| 大任务 | 后台任务进度、取消、幂等提交；PDF 渲染按页或批次处理 |
+| 浏览器恢复 | 用户逐文档主动开启的 IndexedDB 缓存；默认关闭 |
 
-规划中（v0.1+）：OCR、PDF/A、电子书转换、表单填写、i18n、IndexedDB 文件持久化。
+文本替换会重排文本行，原字体和字距不保证保留。旋转页目前不能在编辑器中改字、加字、加图或遮挡；先用旋转工具归一化页面。
 
-## 技术栈
+编辑器的白色覆盖是视觉遮挡，不能作为安全脱敏使用，也不保证清除底层图像或其他 PDF 对象。需要不可恢复地删除敏感内容时，请使用经过验证的安全 redaction 工具并检查输出。
 
-- **后端**：Python 3.13 + FastAPI + PyMuPDF（fitz，PDFium 血统）+ pdf2docx
-- **前端**：React 19 + Vite 7 + TypeScript + Mantine 8 + PDF.js（pdfjs-dist 5）
-- **Office 转换**：LibreOffice headless（隔离 profile + 启动预热 + 串行锁）
-- **测试**：pytest（50 用例）+ Playwright（Chromium e2e）
+## 运行和资源边界
 
-## 从 Stirling-PDF 复用的架构模式
-
-- REST 端点分组 `/api/v1/{general,convert,misc,edit}`（对应原作 `@GeneralApi` 等注解分组）
-- multipart 上传 → 临时文件 → 处理 → 流式响应（`Content-Disposition` + RFC 5987 中文文件名）→ 响应发完即删
-- 临时文件生命周期管理（TempFileManager / TempFile / 周期清理，对应原作同名组件）
-- 前端工具注册表 + 四步工具流（Files → Settings → Execute → Result，对应原作 `createToolFlow`）
-- 页码范围语法 `"1,3,5-8,all"`；输出命名 `<原名>_merged.pdf` / `<原名>_split.zip`
-
-简化点：无异步任务队列（同步流式响应）、编辑为服务端会话式（非前端 WASM 重编辑）、行级文本替换为视觉级（不保留原字体字形）。
+- 每次 HTTP 请求体上限为 **600 MiB**（`600 × 1024 × 1024` 字节），统计完整 multipart 请求，包括多个文件、字段和边界。超限返回 `413 UPLOAD_TOO_LARGE`。该限制按请求计算，不是单文件限制。
+- 不设固定 PDF 页数上限。能否完成取决于单页尺寸、实际渲染资源、可用磁盘、时间和系统预算。
+- 一个重任务运行、最多一个排队；队列满时返回 `429 JOB_QUEUE_FULL`。长任务返回 `202` 和 `jobId`，用 `GET /api/v1/jobs/{jobId}` 查询进度，用 `POST /api/v1/jobs/{jobId}/cancel` 请求取消。长任务使用 `Idempotency-Key` 防止重复提交。
+- PyMuPDF 重任务在独立子进程执行。worker 内存预算为 2 GiB，任务墙钟预算为 15 分钟；超限会终止 worker、清理临时产物并保留原会话文件。
+- **24 MP** 是单页预览预算；超出时降低预览分辨率并提示。**160 MP** 是每个渲染批次的在途像素预算，不是整个导出的累计上限；处理后会释放每批像素缓冲。
+- `/api/health` 是不依赖 LibreOffice 的轻量存活检查。`/api/health/ready` 返回缓存的 LibreOffice readiness；转换探测有超时和刷新间隔，不由 health 请求同步等待。
+- 编辑会话在内存中，服务重启后不会恢复；活动编辑器定期 heartbeat，2 小时无活动后过期。关闭文件会立即清理会话。
 
 ## 快速开始
 
-**一键启动（Windows）**：双击 `start-editor.bat`——自动启动后端（8000）与前端（5173）两个服务窗口，就绪后自动打开浏览器。关闭这两个窗口即停止全部服务。脚本会先检查依赖，缺失时给出安装提示。
+### Windows 一键启动
 
-**手动启动**：
+双击项目根目录的 `start-editor.bat`。服务仅绑定 `127.0.0.1`；打开 **http://127.0.0.1:5173**。Office→PDF 需要安装本机 LibreOffice。若自动检测不到，可设置 `PDF_EDITOR_SOFFICE` 指向 `soffice.exe`。
 
-```bash
-# 后端（端口 8000）
+### 手动启动
+
+```powershell
+# 后端
 cd backend
-pip install -r requirements.txt
-uvicorn app.main:app --port 8000
+python -m pip install -r requirements.lock
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
-# 前端（端口 5173，/api 代理到 8000）
+# 前端（另开一个终端）
 cd frontend
-npm install
-npm run dev
+npm ci --legacy-peer-deps
+npm run dev -- --host 127.0.0.1
 ```
 
-打开 **http://localhost:5173**（用 localhost，不要用 127.0.0.1）。右上角徽章显示「后端已连接」即正常。
+浏览器打开 **http://127.0.0.1:5173**。后端只允许本机 Host，并只接受该前端 Origin；应用没有鉴权，不支持局域网或公网部署。
 
-### 测试
+## 编辑器保存、撤销和恢复
 
-```bash
+- 打开文件后，前端按视口懒加载页面与文本；保存请求携带当前 `revision`。版本过期或文本锚点不匹配时返回 `409 REVISION_CONFLICT`，未确认草稿会保留。
+- 删除、移动页面、插入文字/图片等会影响页面或文本模型的操作，会先要求保存、放弃或取消。另存为会先提交文字草稿。关闭、换文件和重载不会静默丢弃草稿。
+- 可逆操作使用轻量逆操作记录；需要时使用服务端快照。历史最多 10 步、快照总量最多 1 GiB；大文件可能无法保留 10 步。容量不足时会先询问如何继续。页面刷新或从浏览器缓存恢复后，撤销/重做历史从空状态开始。
+- IndexedDB 默认关闭。开启前须逐文档确认文档不敏感；缓存未加密，7 天过期，并可按文档或全部清除。浏览器配额不足时会显示缓存未保存，不影响服务端会话。
+
+## 测试和构建
+
+```powershell
+# Python 后端测试及审计/SBOM 工具
 cd backend
-python -m pytest            # 51 用例（pytest）
+python -m pip install -r requirements-dev.lock
+python -m pytest -ra
 
+# 前端检查
 cd ../frontend
-npm test                    # 4 用例（vitest 冒烟）
+npm ci --legacy-peer-deps
+npx tsc --noEmit
+npm test
+npm run build
+npx playwright install chromium
+npm run test:e2e
 ```
 
-## 使用指南
+Playwright 配置会启动本地后端和 Vite。开发机默认使用已安装的 Chrome；CI 使用 Playwright Chromium。GitHub Actions 分别定义 Linux 后端、Windows + LibreOffice 后端、TypeScript/Vitest/Vite build、Chromium E2E、SBOM 与依赖审计任务，并归档测试结果和审计报告。每次 pytest 通过数、跳过数及跳过原因以 CI 报告为准，不把跳过记作通过。
 
-### 四步工具流
+前端要求 Node.js 22.22.2 或更新的兼容版本。安装命令与 CI 一致使用 `--legacy-peer-deps`，以避开 npm 10 对 Vitest 4 可选 peer 依赖树的解析崩溃；测试所需的 `@testing-library/dom` 已列为直接开发依赖。
 
-所有工具统一流程：**选择文件 → 设置 → 执行 → 下载/预览**。
+### 本机验收记录（2026-10-21）
 
-1. 在工具页点「添加文件」（合并可多选，其余单选）
-2. 合并时用 ↑↓ 调整顺序；其他工具按需填参数
-3. 点「开始处理」，等待完成
-4. 结果页可「下载文件」；PDF 类结果还可「在编辑器中打开」继续编辑
-
-### 该用什么工具
-
-| 需求 | 工具 | 说明 |
-|---|---|---|
-| 几个 PDF 合成一个 | 合并 PDF | 顺序可调；保留各文件书签目录 |
-| 按页拆分 | 拆分 PDF | 页码范围如 `1,3-5` 或 `all`，每段一个 PDF，打包 ZIP |
-| 页面旋转 / 删除 / 重排 | 页面组织分类 | 旋转支持指定页；重排输入新顺序如 `3,1,2` |
-| PDF → 图片 | 格式转换 → PDF→图片 | PNG/JPEG，DPI 36-600（72 屏幕、150 默认、300 打印） |
-| PDF → 文本 | 格式转换 → PDF→文本 | 提取全文为 TXT |
-| PDF → Word | 格式转换 → PDF→Word | 尽力而为的版式重建，转换后需校对 |
-| Office → PDF | 格式转换 → Office→PDF | docx/xlsx/pptx/odt 等；首次约 10-30 秒初始化 |
-| 图片 → PDF | 格式转换 → 图片→PDF | 多张图片，A4/Letter/原尺寸 |
-| 压缩 / 水印 / 页码 | 更多工具 | 三档压缩；水印可调透明度角度字号颜色；页码可选位置与起始值 |
-| 查看文档信息 | 文档信息 | 页数、尺寸、版本、字体、元数据 |
-
-### 可视化编辑器
-
-侧栏「可视化编辑器」进入，打开 PDF 后：
-
-- **改文字**：默认「选择/改字」模式，点击任意文本行直接输入，`Ctrl+Z` 可撤销，完成后点「保存」（有未保存标记与关闭提醒）
-- **加文字/图片**：切换到对应模式，在页面上点击目标位置，图片默认 120×80pt
-- **涂抹**：在页面上拖拽划选区域，白色覆盖（同时清除底层文本，不影响图片/线条）
-- **旋转/删页/移动页**：切换到对应模式后点击页面（删页有确认；移动页先点源页再点目标页）
-- **查找**：工具栏输入文字，所有匹配行黄色高亮并显示匹配数
-- **缩放**：工具栏百分比两侧按钮，或缩放过小过大时注意性能
-- **另存为**：导出为新文件，不覆盖会话
-
-注意：修改文本行会重排该行文字，原字体/字距不保留（自动选 Helvetica/中文字体 + 字号自适应缩小）；已旋转的页面为只读，需先用「旋转页面」工具归一化。
-
-### 页码范围语法
-
-`1`（第 1 页）、`3-5`（第 3 到 5 页）、`1,3,5-8`（混合，逗号分隔）、`all`（全部）。页码从 1 开始，越界会报错提示。
-
-## 项目结构
-
-```
-pdf-editor/
-├── backend/
-│   ├── app/
-│   │   ├── main.py               # FastAPI 入口、CORS、lifespan（清理 + LO 预热）
-│   │   ├── config.py             # 环境变量配置
-│   │   ├── core/                 # tempfile / responses / errors / pdf_engine
-│   │   ├── routers/              # general / convert / misc / edit
-│   │   └── services/             # libreoffice / pdf2docx / sessions
-│   └── tests/                    # pytest（fixtures 生成样例 PDF/docx/png）
-└── frontend/
-    └── src/
-        ├── api/                  # client + editor API
-        ├── components/           # ToolFlow / PdfViewer
-        ├── contexts/             # FileContext
-        ├── lib/                  # pdfjs loader / pending-file bridge
-        ├── pages/                # Home / ToolPage / EditorPage
-        └── tools/                # registry + 12 个工具组件
-```
+- Python 3.13.12 锁定环境：pytest **90 passed，0 skipped**；包含本机 LibreOffice Office→PDF 成功路径。收到一条 Starlette/httpx 弃用提示。
+- 本机 Node.js 22.19.0 / npm 10.9.3：TypeScript 通过，Vitest **22/22**，Playwright Chromium E2E **3/3**，Vite production build 通过。CI 固定使用 Node.js 22.22.2，以符合 jsdom 的 Node 引擎要求。
+- 依赖审计：`pip-audit` 与 `npm audit --audit-level=moderate` 均为 **0 项已知漏洞**。本地 CycloneDX 结果含 Python 88 个组件、前端 265 个组件；CI 每次运行重新生成 SBOM。
+- Vite build 仍提示 `EditorPage.tsx` 同时被动态和静态导入，以及 bundle 存在大于 500 kB 的 chunk；不影响 build 成功。
+- 本机验收已完成；托管 GitHub Actions 尚未因未推送而触发。
 
 ## 已知限制
 
-1. **PDF → Word（pdf2docx）为尽力而为的版式重建**：复杂排版、扫描件、艺术字会丢失格式，转换后需校对。
-2. **Office → PDF 依赖本机 LibreOffice**：首次转换需初始化其配置（约 10-30 秒）。若 LibreOffice 损坏，`/api/health` 的 `libreoffice` 字段为 false，相关测试自动跳过。
-3. **可视化编辑器为行级视觉替换**：修改文本行时原字体/字距不保留（自动选择 Helvetica/中文内置字体 + 字号自适应缩小）；扫描件无文本层，只能添加文字/涂抹。
-4. **旋转页（rotation ≠ 0）暂不支持编辑**：请先用「旋转页面」工具归一化。
-5. **文件列表存于内存**：刷新页面需重新选择文件（IndexedDB 持久化列 v0.1）。
-6. **PyMuPDF 为 AGPL-3.0**：本项目仅供学习研究使用，商用需评估 Artifex 商业许可。
+1. PDF→Word 是尽力而为的版式重建，复杂排版和扫描件需校对；本项目没有 OCR。
+2. Office→PDF 依赖本机 LibreOffice；未安装或 readiness 失败时该转换不可用。启动检查 `/api/health/ready`。
+3. 密码保护的 PDF 暂不支持处理；文档信息工具会将加密状态显示为“是 / 否 / 无法确认”。
+4. PDF 对象优化不做图像降采样，文件变小的幅度取决于具体文档。
+5. 浏览器本地恢复缓存未加密；不要对敏感文件开启。
+6. 安装依赖时需要访问 Python/npm 软件源；安装完成后，PDF 处理不依赖云服务。
 
-## 环境说明（Windows 开发机）
+## 许可证
 
-- Python 依赖装在 managed venv（`~/.workbuddy/binaries/python/envs/default`），前端 `node_modules` 为项目本地安装。
-- LibreOffice 位于 `C:\Program Files\LibreOffice`，服务使用 `-env:UserInstallation` 隔离 profile，不与桌面版冲突。
-
-## 许可
-
-本项目代码：MIT。依赖许可见各自项目（PyMuPDF AGPL-3.0 需注意）。
+仓库根目录 `LICENSE` 保持原样。第三方依赖许可和 PyMuPDF 双许可说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。PyMuPDF 可按 AGPL-3.0 或 Artifex 商业许可使用；项目所有者尚需选择适用路径并记录决定。公开分发前应完成该决定及对应许可检查。

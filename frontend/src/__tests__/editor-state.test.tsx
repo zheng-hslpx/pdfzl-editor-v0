@@ -142,12 +142,15 @@ describe("editor dirty-draft protection", () => {
     mocks.deleteDraft.mockResolvedValue(undefined);
     mocks.clearAllDrafts.mockResolvedValue(undefined);
     mocks.openPdfDocument.mockResolvedValue({
-      getPage: async () => ({
-        getViewport: () => ({ width: 714, height: 1010 }),
-        render: () => ({ promise: Promise.resolve(), cancel: () => undefined }),
-        cleanup: () => undefined,
+      promise: Promise.resolve({
+        numPages: 1,
+        getPage: async () => ({
+          getViewport: () => ({ width: 714, height: 1010 }),
+          render: () => ({ promise: Promise.resolve(), cancel: () => undefined }),
+          cleanup: () => undefined,
+        }),
       }),
-      destroy: () => undefined,
+      destroy: vi.fn().mockResolvedValue(undefined),
     });
   });
 
