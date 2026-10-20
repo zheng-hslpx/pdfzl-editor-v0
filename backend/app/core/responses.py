@@ -7,6 +7,7 @@ parameter so Chinese names survive browser round-trips.
 from __future__ import annotations
 
 import shutil
+import re
 from pathlib import Path
 from urllib.parse import quote
 
@@ -17,20 +18,27 @@ from .tempfile import temp_manager
 
 
 def _ascii_fallback(filename: str) -> str:
-    return (
-        filename.encode("ascii", "replace").decode("ascii").replace('"', "'")
-    )
+    safe = _safe_filename(filename)
+    return safe.encode("ascii", "replace").decode("ascii").replace('"', "'")
+
+
+def _safe_filename(filename: str) -> str:
+    """Return a basename safe for both RFC 6266 parameters and Windows."""
+    value = str(filename).replace("\\", "/").split("/")[-1]
+    value = re.sub(r"[\x00-\x1f\x7f]", "", value).strip().strip(".")
+    return value or "download.pdf"
 
 
 def content_disposition(filename: str, inline: bool = False) -> str:
     disposition = "inline" if inline else "attachment"
+    filename = _safe_filename(filename)
     fallback = _ascii_fallback(filename)
     try:
         filename.encode("ascii")
     except UnicodeEncodeError:
         encoded = quote(filename, safe="")
         return f"{disposition}; filename=\"{fallback}\"; filename*=utf-8''{encoded}"
-    return f'{disposition}; filename="{filename}"'
+    return f'{disposition}; filename="{fallback}"'
 
 
 def _safe_unlink(path: Path) -> None:

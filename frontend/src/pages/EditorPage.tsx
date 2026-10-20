@@ -7,6 +7,7 @@ import {
   ColorInput,
   FileButton,
   Group,
+  Modal,
   NumberInput,
   Paper,
   SegmentedControl,
@@ -35,7 +36,7 @@ const MODES: { value: EditMode; label: string }[] = [
   { value: "select", label: "选择/改字" },
   { value: "text", label: "加文字" },
   { value: "image", label: "加图片" },
-  { value: "redact", label: "涂抹" },
+  { value: "redact", label: "视觉遮挡" },
   { value: "rotate", label: "旋转" },
   { value: "delete", label: "删页" },
   { value: "move", label: "移动页" },
@@ -57,6 +58,10 @@ export function EditorPage() {
 
   // session state
   const [docId, setDocId] = useState<string | null>(null);
+  const revisionRef = useRef(0);
+  const updateRevision = (value: number) => {
+    revisionRef.current = value;
+  };
   const [originalName, setOriginalName] = useState("document.pdf");
   const [pages, setPages] = useState<PageModel[]>([]);
   const [pdfBytes, setPdfBytes] = useState<Uint8Array | null>(null);
@@ -67,7 +72,12 @@ export function EditorPage() {
   const [mode, setMode] = useState<EditMode>("select");
   const [edits, setEdits] = useState<Record<string, string>>({});
   const [dirty, setDirty] = useState(false);
+  const [hasServerChanges, setHasServerChanges] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [pendingAction, setPendingAction] = useState<{
+    run: () => Promise<void>;
+    requireExport: boolean;
+  } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [findQuery, setFindQuery] = useState("");
 
@@ -76,7 +86,8 @@ export function EditorPage() {
   const [addTextAt, setAddTextAt] = useState<{ page: number; x: number; y: number } | null>(null);
 
   const imageInputRef = useRef<HTMLInputElement>(null);
-  const pendingImagePage = useRef<{ page: number; x: number; y: number } | null>(null);
+  const pendingImagePage = useRef<{ page: number; x: number; y: number; pageId: string } | null>(null);
+  const editsRef = useRef<Record<string, string>>({});
 
   const notify = useCallback((msg: string) => {
     setToast(msg);
@@ -124,31 +135,57 @@ export function EditorPage() {
   const applyResult = useCallback(
     async (result: editorApi.EditorResult, id: string) => {
       setPages(result.textModel);
+      updateRevision(result.revision);
+      setHasServerChanges(true);
       await refreshBytes(id);
     },
     [refreshBytes],
   );
 
-  const openFile = useCallback(
+  const openFileNow = useCallback(
     async (file: File) => {
       setBusy(true);
+      let openedId: string | null = null;
       try {
         const result = await editorApi.openEditor(file);
+        openedId = result.docId;
+        const bytes = await editorApi.fetchSessionBytes(result.docId);
+        if (docId) await editorApi.closeSession(docId);
         setDocId(result.docId);
+        updateRevision(result.revision);
         setOriginalName(result.originalName);
         setPages(result.textModel);
+        editsRef.current = {};
         setEdits({});
         setDirty(false);
-        // fetch rendered bytes
-        setPdfBytes(await editorApi.fetchSessionBytes(result.docId));
+        setHasServerChanges(false);
+        setPdfBytes(bytes);
         notify(`已打开 ${result.originalName}（${result.pageCount} 页）`);
       } catch (err) {
+        if (openedId) void editorApi.closeSession(openedId).catch(() => undefined);
         notify(await extractError(err));
       } finally {
         setBusy(false);
       }
     },
-    [notify],
+    [docId, notify],
+  );
+
+  const requestAction = useCallback(
+    (action: () => Promise<void>, requireExport = false) => {
+      if (busy) return;
+      if (dirty || (requireExport && hasServerChanges)) {
+        setPendingAction({ run: action, requireExport });
+        return;
+      }
+      void action();
+    },
+    [busy, dirty, hasServerChanges],
+  );
+
+  const openFile = useCallback(
+    (file: File) => requestAction(() => openFileNow(file), true),
+    [openFileNow, requestAction],
   );
 
   // pick up a file handed over from a tool result ("在编辑器中打开")
@@ -166,15 +203,19 @@ export function EditorPage() {
   // save / save-as
   // ------------------------------------------------------------------
 
-  const handleSave = useCallback(async () => {
-    if (!docId) return;
-    const changed = Object.entries(edits).filter(([id, text]) => {
+  const handleSave = useCallback(async (): Promise<boolean> => {
+    if (!docId) return false;
+    const submittedEdits = { ...editsRef.current };
+    const changed = Object.entries(submittedEdits).filter(([id, text]) => {
       const line = allLines.find((l) => l.id === id);
       return line && line.text !== text;
     });
     if (changed.length === 0) {
+      editsRef.current = {};
+      setEdits({});
+      setDirty(false);
       notify("没有需要保存的修改");
-      return;
+      return true;
     }
     setBusy(true);
     try {
@@ -182,145 +223,232 @@ export function EditorPage() {
         const line = allLines.find((l) => l.id === id)!;
         return {
           page: line.page,
+          pageId: line.pageId,
+          lineId: line.id,
+          originalHash: line.originalHash,
           bbox: line.bbox,
           original: line.text,
           text,
           fontSize: line.fontSize,
         };
       });
-      const result = await editorApi.applyEdits(docId, payload);
+      const result = await editorApi.applyEdits(docId, revisionRef.current, payload);
       setPages(result.textModel);
-      setEdits({});
-      setDirty(false);
+      updateRevision(result.revision);
+      setHasServerChanges(true);
+      const remaining = { ...editsRef.current };
+      for (const [id, submittedText] of Object.entries(submittedEdits)) {
+        if (remaining[id] === submittedText) delete remaining[id];
+      }
+      editsRef.current = remaining;
+      setEdits(remaining);
+      setDirty(Object.keys(remaining).length > 0);
       await refreshBytes(docId);
       notify(`已保存 ${changed.length} 处修改`);
+      return true;
+    } catch (err) {
+      notify(await extractError(err));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }, [docId, allLines, notify, refreshBytes]);
+
+  const handleSaveAs = useCallback(async (): Promise<boolean> => {
+    if (!docId) return false;
+    if (Object.keys(editsRef.current).length > 0 && !(await handleSave())) return false;
+    const name = window.prompt("另存为文件名：", originalName);
+    if (!name) return false;
+    try {
+      await editorApi.saveEditedAs(docId, name);
+      setHasServerChanges(false);
+      notify(`已导出 ${name}`);
+      return true;
+    } catch (err) {
+      notify(await extractError(err));
+      return false;
+    }
+  }, [docId, dirty, handleSave, originalName, notify]);
+
+  const continueAfterSave = useCallback(async () => {
+    const pending = pendingAction;
+    if (!pending) return;
+    const shouldExport = pending.requireExport || hasServerChanges;
+    if (dirty && !(await handleSave())) return;
+    if (shouldExport && !(await handleSaveAs())) return;
+    setPendingAction(null);
+    await pending.run();
+  }, [dirty, handleSave, handleSaveAs, hasServerChanges, pendingAction]);
+
+  const continueAfterDiscard = useCallback(async () => {
+    const pending = pendingAction;
+    if (!pending) return;
+    editsRef.current = {};
+    setEdits({});
+    setDirty(false);
+    setPendingAction(null);
+    await pending.run();
+  }, [pendingAction]);
+
+  const closeCurrentFile = useCallback(async () => {
+    if (!docId) return;
+    setBusy(true);
+    try {
+      await editorApi.closeSession(docId);
+      setDocId(null);
+      updateRevision(0);
+      setPdfBytes(null);
+      setPages([]);
+      editsRef.current = {};
+      setEdits({});
+      setDirty(false);
+      setHasServerChanges(false);
     } catch (err) {
       notify(await extractError(err));
     } finally {
       setBusy(false);
     }
-  }, [docId, edits, allLines, notify, refreshBytes]);
-
-  const handleSaveAs = useCallback(async () => {
-    if (!docId) return;
-    const name = window.prompt("另存为文件名：", originalName);
-    if (!name) return;
-    try {
-      await editorApi.saveEditedAs(docId, name);
-      notify(`已导出 ${name}`);
-    } catch (err) {
-      notify(await extractError(err));
-    }
-  }, [docId, originalName, notify]);
+  }, [docId, notify]);
 
   // warn on tab close with unsaved edits
   useEffect(() => {
     const handler = (e: BeforeUnloadEvent) => {
-      if (dirty) {
+      if (dirty || hasServerChanges) {
         e.preventDefault();
         e.returnValue = "";
       }
     };
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
-  }, [dirty]);
+  }, [dirty, hasServerChanges]);
+
+  useEffect(() => {
+    if (!docId) return;
+    const heartbeat = window.setInterval(() => {
+      void editorApi.touchSession(docId).catch(() => undefined);
+    }, 5 * 60 * 1000);
+    return () => window.clearInterval(heartbeat);
+  }, [docId]);
 
   // ------------------------------------------------------------------
   // page-level actions
   // ------------------------------------------------------------------
 
   const onPageClick = useCallback(
-    async (pageNo: number, pt: { x: number; y: number }) => {
+    (pageNo: number, pt: { x: number; y: number }) => {
       if (!docId) return;
+      const page = pages[pageNo];
+      if (!page) return;
+      if (page.rotation !== 0 && (mode === "text" || mode === "image" || mode === "redact")) {
+        notify("旋转页暂不支持坐标编辑，请先归一化页面");
+        return;
+      }
       if (mode === "rotate") {
-        setBusy(true);
-        try {
-          await applyResult(await editorApi.rotatePage(docId, pageNo, 90), docId);
-          notify(`第 ${pageNo + 1} 页已旋转 90°`);
-        } catch (err) {
-          notify(await extractError(err));
-        } finally {
-          setBusy(false);
-        }
+        requestAction(async () => {
+          setBusy(true);
+          try {
+            await applyResult(await editorApi.rotatePage(docId, revisionRef.current, pageNo, 90), docId);
+            notify(`第 ${pageNo + 1} 页已旋转 90°`);
+          } catch (err) {
+            notify(await extractError(err));
+          } finally {
+            setBusy(false);
+          }
+        });
       } else if (mode === "delete") {
         if (!window.confirm(`确定删除第 ${pageNo + 1} 页？`)) return;
-        setBusy(true);
-        try {
-          await applyResult(await editorApi.deletePages(docId, [pageNo]), docId);
-          notify(`已删除第 ${pageNo + 1} 页`);
-        } catch (err) {
-          notify(await extractError(err));
-        } finally {
-          setBusy(false);
-        }
+        requestAction(async () => {
+          setBusy(true);
+          try {
+            await applyResult(await editorApi.deletePages(docId, revisionRef.current, [pageNo]), docId);
+            notify(`已删除第 ${pageNo + 1} 页`);
+          } catch (err) {
+            notify(await extractError(err));
+          } finally {
+            setBusy(false);
+          }
+        });
       } else if (mode === "move") {
         if (moveSource === null) {
           setMoveSource(pageNo);
           notify(`已选第 ${pageNo + 1} 页为源，点击目标页完成移动`);
         } else if (moveSource !== pageNo) {
-          setBusy(true);
-          try {
-            await applyResult(await editorApi.movePage(docId, moveSource, pageNo), docId);
-            notify(`第 ${moveSource + 1} 页已移动到第 ${pageNo + 1} 页`);
-          } catch (err) {
-            notify(await extractError(err));
-          } finally {
-            setMoveSource(null);
-            setBusy(false);
-          }
+          requestAction(async () => {
+            setBusy(true);
+            try {
+              await applyResult(await editorApi.movePage(docId, revisionRef.current, moveSource, pageNo), docId);
+              notify(`第 ${moveSource + 1} 页已移动到第 ${pageNo + 1} 页`);
+            } catch (err) {
+              notify(await extractError(err));
+            } finally {
+              setMoveSource(null);
+              setBusy(false);
+            }
+          });
         } else {
           setMoveSource(null);
         }
       } else if (mode === "text") {
         setAddTextAt({ page: pageNo, x: pt.x, y: pt.y });
       } else if (mode === "image") {
-        pendingImagePage.current = { page: pageNo, x: pt.x, y: pt.y };
-        imageInputRef.current?.click();
+        requestAction(async () => {
+          pendingImagePage.current = { page: pageNo, x: pt.x, y: pt.y, pageId: page.pageId };
+          imageInputRef.current?.click();
+        });
       }
     },
-    [docId, mode, moveSource, notify, applyResult],
+    [docId, pages, mode, moveSource, notify, applyResult, requestAction],
   );
 
   const onImagePicked = useCallback(
     async (file: File | null) => {
       const pos = pendingImagePage.current;
       if (!file || !pos || !docId) return;
-      setBusy(true);
-      try {
-        await applyResult(
-          await editorApi.addImage(docId, { image: file, ...pos, w: 120, h: 80 }),
-          docId,
-        );
-        notify("图片已添加");
-      } catch (err) {
-        notify(await extractError(err));
-      } finally {
-        setBusy(false);
-        pendingImagePage.current = null;
-      }
+      requestAction(async () => {
+        setBusy(true);
+        try {
+          await applyResult(
+            await editorApi.addImage(docId, revisionRef.current, { image: file, ...pos, w: 120, h: 80 }),
+            docId,
+          );
+          notify("图片已添加");
+        } catch (err) {
+          notify(await extractError(err));
+        } finally {
+          setBusy(false);
+          pendingImagePage.current = null;
+        }
+      });
     },
-    [docId, notify, applyResult],
+    [docId, notify, applyResult, requestAction],
   );
 
   const onRedactRect = useCallback(
     async (pageNo: number, rect: number[]) => {
       if (!docId) return;
-      setBusy(true);
-      try {
-        await applyResult(
-          await editorApi.applyEdits(docId, [
-            { page: pageNo, bbox: rect, original: "", text: "" },
-          ]),
-          docId,
-        );
-        notify("已涂抹所选区域");
-      } catch (err) {
-        notify(await extractError(err));
-      } finally {
-        setBusy(false);
+      const page = pages[pageNo];
+      if (!page || page.rotation !== 0) {
+        notify("旋转页暂不支持坐标编辑，请先归一化页面");
+        return;
       }
+      requestAction(async () => {
+        setBusy(true);
+        try {
+          await applyResult(
+            await editorApi.applyEdits(docId, revisionRef.current, [
+              { kind: "cover", page: pageNo, pageId: page.pageId, bbox: rect, original: "", text: "" },
+            ]),
+            docId,
+          );
+          notify("已添加视觉遮挡；这不等同于安全脱敏");
+        } catch (err) {
+          notify(await extractError(err));
+        } finally {
+          setBusy(false);
+        }
+      });
     },
-    [docId, notify, applyResult],
+    [docId, pages, notify, applyResult, requestAction],
   );
 
   // ------------------------------------------------------------------
@@ -370,17 +498,38 @@ export function EditorPage() {
 
   return (
     <Stack gap="sm">
+      <Modal
+        opened={pendingAction !== null}
+        onClose={() => setPendingAction(null)}
+        title="有未保存的修改"
+        centered
+      >
+        <Stack gap="sm">
+          <Text size="sm">
+            {pendingAction?.requireExport || hasServerChanges
+              ? "当前编辑只保存在临时会话中。保存会先提交文字草稿，再另存为文件。"
+              : "继续操作前需要处理文字草稿。"}
+          </Text>
+          <Group justify="flex-end">
+            <Button variant="default" onClick={() => setPendingAction(null)}>
+              取消
+            </Button>
+            <Button color="red" variant="light" onClick={() => void continueAfterDiscard()}>
+              放弃草稿并继续
+            </Button>
+            <Button onClick={() => void continueAfterSave()}>
+              {pendingAction?.requireExport || hasServerChanges ? "另存为并继续" : "保存并继续"}
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
       {/* toolbar */}
       <Paper withBorder p="xs" radius="md" style={{ position: "sticky", top: 0, zIndex: 10 }}>
         <Group justify="space-between" wrap="wrap" gap="xs">
           <Group gap="xs">
             <ActionIcon
               variant="subtle"
-              onClick={() => {
-                setDocId(null);
-                setPdfBytes(null);
-                setPages([]);
-              }}
+              onClick={() => requestAction(closeCurrentFile, true)}
               title="关闭文件"
             >
               <IconArrowLeft size={18} />
@@ -389,6 +538,7 @@ export function EditorPage() {
               {originalName}
             </Text>
             {dirty && <Badge color="orange" variant="light">未保存</Badge>}
+            {!dirty && hasServerChanges && <Badge color="yellow" variant="light">待另存</Badge>}
             <Text size="xs" c="dimmed">
               {pages.length} 页
             </Text>
@@ -460,6 +610,12 @@ export function EditorPage() {
         </Alert>
       )}
 
+      {mode === "redact" && (
+        <Alert color="yellow" title="视觉遮挡限制">
+          白色覆盖不保证从图片、附件、元数据或其他 PDF 对象中清除敏感信息，请勿用作安全脱敏。
+        </Alert>
+      )}
+
       <input
         ref={imageInputRef}
         type="file"
@@ -476,8 +632,9 @@ export function EditorPage() {
       <Stack align="center" gap="md" pb="xl">
         {pages.map((p) => (
           <EditorCanvas
-            key={p.page}
+            key={p.pageId}
             page={p}
+            busy={busy}
             scale={scale}
             pdfDoc={pdfDoc}
             mode={mode}
@@ -486,33 +643,45 @@ export function EditorPage() {
             moveSource={moveSource}
             addTextAt={addTextAt?.page === p.page ? addTextAt : null}
             onLineChange={(id, text) => {
-              setEdits((prev) => ({ ...prev, [id]: text }));
+              if (busy) return;
+              const next = { ...editsRef.current, [id]: text };
+              editsRef.current = next;
+              setEdits(next);
               setDirty(true);
             }}
             onPageClick={onPageClick}
             onRedactRect={onRedactRect}
             onAddTextConfirm={async (text, fontSize, color) => {
               if (!addTextAt || !docId) return;
-              setBusy(true);
-              try {
-                await applyResult(
-                  await editorApi.addText(docId, {
-                    page: addTextAt.page,
-                    x: addTextAt.x,
-                    y: addTextAt.y + fontSize,
-                    text,
-                    fontSize,
-                    color,
-                  }),
-                  docId,
-                );
-                notify("文字已添加");
-              } catch (err) {
-                notify(await extractError(err));
-              } finally {
-                setBusy(false);
+              const target = pages[addTextAt.page];
+              if (!target || target.rotation !== 0) {
+                notify("旋转页暂不支持坐标编辑，请先归一化页面");
                 setAddTextAt(null);
+                return;
               }
+              requestAction(async () => {
+                setBusy(true);
+                try {
+                  await applyResult(
+                    await editorApi.addText(docId, revisionRef.current, {
+                      page: addTextAt.page,
+                      pageId: target.pageId,
+                      x: addTextAt.x,
+                      y: addTextAt.y + fontSize,
+                      text,
+                      fontSize,
+                      color,
+                    }),
+                    docId,
+                  );
+                  notify("文字已添加");
+                } catch (err) {
+                  notify(await extractError(err));
+                } finally {
+                  setBusy(false);
+                  setAddTextAt(null);
+                }
+              });
             }}
             onAddTextCancel={() => setAddTextAt(null)}
           />
@@ -528,6 +697,7 @@ export function EditorPage() {
 
 interface EditorCanvasProps {
   page: PageModel;
+  busy: boolean;
   scale: number;
   pdfDoc: { getPage: (n: number) => Promise<unknown> } | null;
   mode: EditMode;
@@ -544,7 +714,7 @@ interface EditorCanvasProps {
 
 function EditorCanvas(props: EditorCanvasProps) {
   const {
-    page, scale, pdfDoc, mode, edits, findMatches, moveSource, addTextAt,
+    page, busy, scale, pdfDoc, mode, edits, findMatches, moveSource, addTextAt,
     onLineChange, onPageClick, onRedactRect, onAddTextConfirm, onAddTextCancel,
   } = props;
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -613,13 +783,13 @@ function EditorCanvas(props: EditorCanvasProps) {
           outline: moveSource === page.page ? "3px solid #339af0" : undefined,
         }}
         onMouseDown={(e) => {
-          if (mode !== "redact") return;
+          if (mode !== "redact" || page.rotation !== 0 || busy) return;
           const pt = ptFromEvent(e.clientX, e.clientY);
           setDragStart(pt);
           setDragRect({ x: pt.x, y: pt.y, w: 0, h: 0 });
         }}
         onMouseMove={(e) => {
-          if (mode !== "redact" || !dragStart) return;
+          if (mode !== "redact" || page.rotation !== 0 || busy || !dragStart) return;
           const pt = ptFromEvent(e.clientX, e.clientY);
           setDragRect({
             x: Math.min(dragStart.x, pt.x),
@@ -629,7 +799,7 @@ function EditorCanvas(props: EditorCanvasProps) {
           });
         }}
         onMouseUp={() => {
-          if (mode !== "redact" || !dragRect) return;
+          if (mode !== "redact" || page.rotation !== 0 || busy || !dragRect) return;
           if (dragRect.w > 3 && dragRect.h > 3) {
             onRedactRect(page.page, [
               dragRect.x, dragRect.y, dragRect.x + dragRect.w, dragRect.y + dragRect.h,
@@ -660,7 +830,7 @@ function EditorCanvas(props: EditorCanvasProps) {
               <textarea
                 key={line.id}
                 value={value}
-                readOnly={mode !== "select" || page.rotation !== 0}
+                readOnly={mode !== "select" || page.rotation !== 0 || busy}
                 onChange={(e) => onLineChange(line.id, e.target.value)}
                 title={page.rotation !== 0 ? "旋转页暂不支持编辑，请先用旋转工具归一化" : undefined}
                 style={{
@@ -683,7 +853,7 @@ function EditorCanvas(props: EditorCanvasProps) {
                   fontFamily: fontStyle.family,
                   fontWeight: fontStyle.weight,
                   fontStyle: fontStyle.style,
-                  cursor: mode === "select" && page.rotation === 0 ? "text" : "default",
+                  cursor: mode === "select" && page.rotation === 0 && !busy ? "text" : "default",
                 }}
               />
             );
@@ -718,7 +888,7 @@ function EditorCanvas(props: EditorCanvasProps) {
       </div>
       <Text size="xs" c="dimmed" ta="center" mt={4}>
         第 {page.page + 1} 页
-        {page.rotation !== 0 && "（已旋转，只读）"}
+        {page.rotation !== 0 && "（已旋转，坐标编辑已禁用）"}
       </Text>
     </div>
   );

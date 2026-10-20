@@ -31,14 +31,14 @@ def open_pdf(path: Path) -> fitz.Document:
     try:
         doc = fitz.open(str(path))
     except Exception as exc:  # noqa: BLE001 - fitz raises broad types
-        raise PdfError(400, f"无法打开 PDF 文件: {exc}") from exc
+        raise PdfError(400, "上传内容不是可读取的 PDF", code="INVALID_PDF") from exc
     if doc.is_encrypted:
         if not doc.authenticate(""):
             doc.close()
-            raise PdfError(400, "PDF 已加密，暂不支持处理加密文件")
+            raise PdfError(400, "PDF 已加密，暂不支持处理加密文件", code="ENCRYPTED_PDF")
     if doc.page_count == 0:
         doc.close()
-        raise PdfError(400, "PDF 没有任何页面")
+        raise PdfError(400, "PDF 没有任何页面", code="INVALID_PDF")
     return doc
 
 

@@ -10,6 +10,8 @@ Patterns ported from Stirling-PDF (Java):
 from __future__ import annotations
 
 import shutil
+import logging
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -17,6 +19,11 @@ from pathlib import Path
 from typing import Iterator
 
 from .. import config
+from .errors import PdfError
+from .input_validation import validate_pdf
+from .input_validation import validate_pdf
+
+logger = logging.getLogger("pdf_editor.temp")
 
 
 class TempFileManager:
@@ -26,6 +33,7 @@ class TempFileManager:
         self.base_dir = base_dir
         self.ttl_hours = ttl_hours
         self._registry: dict[Path, float] = {}
+        self._lock = threading.RLock()
         base_dir.mkdir(parents=True, exist_ok=True)
 
     # -- creation -----------------------------------------------------
@@ -43,10 +51,12 @@ class TempFileManager:
 
     # -- registry -----------------------------------------------------
     def register(self, path: Path) -> None:
-        self._registry[path] = time.time()
+        with self._lock:
+            self._registry[path] = time.time()
 
     def unregister(self, path: Path) -> None:
-        self._registry.pop(path, None)
+        with self._lock:
+            self._registry.pop(path, None)
 
     # -- cleanup ------------------------------------------------------
     def cleanup_old(self, max_age_hours: float | None = None) -> int:
@@ -54,27 +64,62 @@ class TempFileManager:
         max_age = (max_age_hours if max_age_hours is not None else self.ttl_hours) * 3600
         now = time.time()
         removed = 0
-        for path, created in list(self._registry.items()):
+        with self._lock:
+            entries = list(self._registry.items())
+        for path, created in entries:
             if now - created > max_age:
-                removed += 1 if self._delete(path) else 0
-                self.unregister(path)
+                if self._delete(path):
+                    removed += 1
+                    self.unregister(path)
+                else:
+                    logger.warning("Could not delete expired temporary path: %s", path)
+        return removed
+
+    def cleanup_orphans(self) -> int:
+        """Clean old unregistered top-level temp entries at process startup."""
+        cutoff = time.time() - self.ttl_hours * 3600
+        removed = 0
+        with self._lock:
+            registered = set(self._registry)
+        try:
+            children = list(self.base_dir.iterdir())
+        except OSError:
+            logger.exception("Could not scan temporary directory: %s", self.base_dir)
+            return 0
+        for path in children:
+            if path.name == "sessions" or path in registered:
+                continue
+            try:
+                if path.stat().st_mtime > cutoff:
+                    continue
+            except OSError:
+                logger.warning("Could not stat temporary path: %s", path)
+                continue
+            if self._delete(path):
+                removed += 1
+            else:
+                logger.warning("Could not delete orphan temporary path: %s", path)
         return removed
 
     @staticmethod
     def _delete(path: Path) -> bool:
         try:
             if path.is_dir():
-                shutil.rmtree(path, ignore_errors=True)
+                shutil.rmtree(path)
             elif path.exists():
                 path.unlink(missing_ok=True)
             return True
         except OSError:
             return False
 
-    def discard(self, path: Path) -> None:
+    def discard(self, path: Path) -> bool:
         """Explicitly delete a temp path (RAII close)."""
-        self._delete(path)
-        self.unregister(path)
+        deleted = self._delete(path)
+        if deleted:
+            self.unregister(path)
+        else:
+            logger.warning("Could not discard temporary path; retained for retry: %s", path)
+        return deleted
 
 
 temp_manager = TempFileManager(config.TEMP_DIR, config.TEMP_TTL_HOURS)
@@ -101,10 +146,22 @@ def temp_dir(prefix: str = "pdfeditor-") -> Iterator[Path]:
 async def save_upload(upload, suffix: str = ".pdf") -> Path:
     """Stream an UploadFile into a registered temp file (1 MiB chunks)."""
     dest = temp_manager.create_temp_file(suffix)
+    size = 0
     try:
         with open(dest, "wb") as fh:
             while chunk := await upload.read(1024 * 1024):
+                size += len(chunk)
+                if size > config.MAX_UPLOAD_BYTES:
+                    raise PdfError(
+                        413,
+                        f"单个文件超过 {config.MAX_UPLOAD_MB} MiB 上传上限",
+                        code="UPLOAD_TOO_LARGE",
+                    )
                 fh.write(chunk)
+        if suffix.lower() == ".pdf":
+            validate_pdf(dest)
+        if suffix.lower() == ".pdf":
+            validate_pdf(dest)
     except BaseException:
         temp_manager.discard(dest)
         raise

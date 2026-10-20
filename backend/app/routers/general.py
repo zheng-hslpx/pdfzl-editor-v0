@@ -112,28 +112,39 @@ async def merge_pdfs(
     names = [f.filename or "file.pdf" for f in fileInput]
     order = _resolve_order(fileOrder, names)
 
-    inputs = [await save_upload(f) for f in fileInput]
-    ordered = [inputs[i] for i in order]
-    out = fitz.open()
-    toc: list[list] = []
+    inputs = []
+    dest = None
+    response_ready = False
     try:
-        for path in ordered:
-            src = pdf_engine.open_pdf(path)
-            start = out.page_count
-            out.insert_pdf(src)
-            for level, title, page in src.get_toc():
-                toc.append([level, title, page + start])
-            src.close()
-        if toc:
-            out.set_toc(toc)
-        dest = temp_manager.create_temp_file(".pdf")
-        pdf_engine.save_atomic(out, dest, garbage=4, deflate=True)
+        for upload in fileInput:
+            inputs.append(await save_upload(upload))
+        ordered = [inputs[i] for i in order]
+        out = fitz.open()
+        toc: list[list] = []
+        try:
+            for path in ordered:
+                src = pdf_engine.open_pdf(path)
+                try:
+                    start = out.page_count
+                    out.insert_pdf(src)
+                    for level, title, page in src.get_toc():
+                        toc.append([level, title, page + start])
+                finally:
+                    src.close()
+            if toc:
+                out.set_toc(toc)
+            dest = temp_manager.create_temp_file(".pdf")
+            pdf_engine.save_atomic(out, dest, garbage=4, deflate=True)
+        finally:
+            out.close()
+        response = file_response(dest, f"{_base_name(names[order[0]])}_merged.pdf")
+        response_ready = True
+        return response
     finally:
-        out.close()
         for path in inputs:
             temp_manager.discard(path)
-
-    return file_response(dest, f"{_base_name(names[order[0]])}_merged.pdf")
+        if dest is not None and not response_ready:
+            temp_manager.discard(dest)
 
 
 @router.post("/split-pages", summary="按页码范围拆分（输出 ZIP）")
@@ -142,13 +153,15 @@ async def split_pages(
     pageRanges: str = Form(default=""),
 ):
     src_path = await save_upload(fileInput)
-    doc = pdf_engine.open_pdf(src_path)
-    total = doc.page_count
-    segments = _parse_segments(pageRanges, total)
     base = _base_name(fileInput.filename)
-
-    zip_path = temp_manager.create_temp_file(".zip")
+    doc = None
+    zip_path = None
+    response_ready = False
     try:
+        doc = pdf_engine.open_pdf(src_path)
+        total = doc.page_count
+        segments = _parse_segments(pageRanges, total)
+        zip_path = temp_manager.create_temp_file(".zip")
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for pages, label in segments:
                 seg = fitz.open()
@@ -158,13 +171,17 @@ async def split_pages(
                 finally:
                     seg.close()
                 zf.writestr(f"{base}_pages_{label}.pdf", seg_bytes)
+        response = file_response(
+            zip_path, f"{base}_split.zip", media_type="application/zip"
+        )
+        response_ready = True
+        return response
     finally:
-        doc.close()
+        if doc is not None:
+            doc.close()
         temp_manager.discard(src_path)
-
-    return file_response(
-        zip_path, f"{base}_split.zip", media_type="application/zip"
-    )
+        if zip_path is not None and not response_ready:
+            temp_manager.discard(zip_path)
 
 
 @router.post("/rotate", summary="旋转页面")

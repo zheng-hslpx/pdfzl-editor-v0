@@ -3,6 +3,7 @@ import { downloadBlob } from "./client";
 
 export interface PageMeta {
   page: number;
+  pageId: string;
   width: number;
   height: number;
   rotation: number;
@@ -10,6 +11,8 @@ export interface PageMeta {
 
 export interface TextLine {
   id: string;
+  pageId: string;
+  originalHash: string;
   bbox: number[];
   fontSize: number;
   font: string;
@@ -25,6 +28,7 @@ export interface OpenResult {
   docId: string;
   originalName: string;
   pageCount: number;
+  revision: number;
   pages: PageMeta[];
   textModel: PageModel[];
 }
@@ -32,12 +36,17 @@ export interface OpenResult {
 export interface EditorResult {
   ok: boolean;
   pageCount: number;
+  revision: number;
   pages: PageMeta[];
   textModel: PageModel[];
 }
 
 export interface EditPayload {
+  kind?: "text" | "cover";
   page: number;
+  pageId?: string;
+  lineId?: string;
+  originalHash?: string;
   bbox: number[];
   original: string;
   text: string;
@@ -52,21 +61,24 @@ export async function openEditor(file: File): Promise<OpenResult> {
 
 export async function applyEdits(
   docId: string,
+  expectedRevision: number,
   edits: EditPayload[],
 ): Promise<EditorResult> {
-  return postBody<EditorResult>(`/edit/${docId}/apply`, { edits });
+  return postBody<EditorResult>(`/edit/${docId}/apply`, { expectedRevision, edits });
 }
 
 export async function addText(
   docId: string,
-  params: { page: number; x: number; y: number; text: string; fontSize: number; color: string },
+  expectedRevision: number,
+  params: { page: number; pageId: string; x: number; y: number; text: string; fontSize: number; color: string },
 ): Promise<EditorResult> {
-  return postBody<EditorResult>(`/edit/${docId}/text/add`, params);
+  return postBody<EditorResult>(`/edit/${docId}/text/add`, { ...params, expectedRevision });
 }
 
 export async function addImage(
   docId: string,
-  params: { image: File; page: number; x: number; y: number; w: number; h: number },
+  expectedRevision: number,
+  params: { image: File; page: number; pageId: string; x: number; y: number; w: number; h: number },
 ): Promise<EditorResult> {
   const form = new FormData();
   form.append("image", params.image, params.image.name);
@@ -75,34 +87,43 @@ export async function addImage(
   form.append("y", String(params.y));
   form.append("w", String(params.w));
   form.append("h", String(params.h));
+  form.append("expectedRevision", String(expectedRevision));
+  form.append("pageId", params.pageId);
   return postJson<EditorResult>(`/edit/${docId}/image/add`, form);
 }
 
 export async function rotatePage(
   docId: string,
+  expectedRevision: number,
   page: number,
   angle = 90,
 ): Promise<EditorResult> {
-  return postBody<EditorResult>(`/edit/${docId}/pages/rotate`, { page, angle });
+  return postBody<EditorResult>(`/edit/${docId}/pages/rotate`, { expectedRevision, page, angle });
 }
 
 export async function deletePages(
   docId: string,
+  expectedRevision: number,
   pages: number[],
 ): Promise<EditorResult> {
-  return postBody<EditorResult>(`/edit/${docId}/pages/delete`, { pages });
+  return postBody<EditorResult>(`/edit/${docId}/pages/delete`, { expectedRevision, pages });
 }
 
 export async function movePage(
   docId: string,
+  expectedRevision: number,
   from: number,
   to: number,
 ): Promise<EditorResult> {
-  return postBody<EditorResult>(`/edit/${docId}/pages/move`, { from, to });
+  return postBody<EditorResult>(`/edit/${docId}/pages/move`, { expectedRevision, from, to });
 }
 
 export async function closeSession(docId: string): Promise<void> {
   await postBody(`/edit/${docId}/close`, {});
+}
+
+export async function touchSession(docId: string): Promise<void> {
+  await postBody(`/edit/${docId}/touch`, {});
 }
 
 export async function saveEditedAs(docId: string, filename: string): Promise<void> {

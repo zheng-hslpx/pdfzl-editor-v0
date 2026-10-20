@@ -1,12 +1,28 @@
 """Shared pytest fixtures: sample PDFs (latin + Chinese), docx, png."""
 from __future__ import annotations
 
+import os
+import shutil
+import uuid
 from pathlib import Path
 
 import fitz
 import pytest
 from docx import Document
 from PIL import Image
+
+# Keep application-created uploads/sessions separate from the developer's
+# backend/temp directory and remove this run's data when pytest exits.
+_PYTEST_TEMP_ROOT = (
+    Path(__file__).resolve().parents[1]
+    / ".pytest-temp"
+    / f"run-{os.getpid()}-{uuid.uuid4().hex}"
+    / "app"
+)
+_PYTEST_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+os.environ["PDF_EDITOR_TEMP_DIR"] = str(_PYTEST_TEMP_ROOT)
+os.environ["PDF_EDITOR_MAX_UPLOAD_MB"] = "600"
+os.environ["PDF_EDITOR_CORS_ORIGINS"] = "http://127.0.0.1:5173"
 
 
 def make_sample_pdf(path: Path, pages: int = 3) -> Path:
@@ -69,7 +85,7 @@ def client():
 
     from app.main import app
 
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://127.0.0.1") as c:
         yield c
 
 
@@ -78,3 +94,16 @@ def temp_dir_path():
     from app import config
 
     return config.TEMP_DIR
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_app_temp():
+    yield
+    try:
+        from app.services.sessions import session_manager
+        from app.core.tempfile import temp_manager
+
+        session_manager.close_all()
+        temp_manager.cleanup_old(0)
+    finally:
+        shutil.rmtree(_PYTEST_TEMP_ROOT.parent, ignore_errors=True)

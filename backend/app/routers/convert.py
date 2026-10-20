@@ -17,6 +17,7 @@ from fastapi import APIRouter, File, Form, UploadFile
 
 from ..core import pdf_engine
 from ..core.errors import PdfError
+from ..core.input_validation import validate_image
 from ..core.responses import file_response
 from ..core.tempfile import save_upload, temp_manager
 from ..services import libreoffice
@@ -133,46 +134,46 @@ async def image_to_pdf(
         raise PdfError(400, "页面尺寸仅支持 a4 / letter / source")
 
     inputs = []
-    for f in fileInput:
-        ext = Path(f.filename or "image.png").suffix.lower() or ".png"
-        if ext not in IMAGE_EXTENSIONS:
-            raise PdfError(400, f"不支持的图片格式: {f.filename}")
-        inputs.append(await save_upload(f, suffix=ext))
-
-    out = fitz.open()
     try:
-        for path in inputs:
-            try:
-                img = fitz.open(str(path))
-            except Exception as exc:  # noqa: BLE001
-                raise PdfError(400, f"无法读取图片 {path.name}: {exc}") from exc
-            try:
-                if pageSize == "source":
-                    pix = fitz.Pixmap(str(path))
-                    page = out.new_page(width=pix.width, height=pix.height)
-                    pix = None
-                    page.insert_image(page.rect, filename=str(path), keep_proportion=fit)
-                else:
-                    target = fitz.paper_rect(pageSize)
-                    page = out.new_page(width=target.width, height=target.height)
-                    margin = 36
-                    avail = fitz.Rect(
-                        margin, margin, target.width - margin, target.height - margin
-                    )
-                    page.insert_image(
-                        avail,
-                        filename=str(path),
-                        keep_proportion=fit,
-                    )
-            finally:
-                img.close()
+        for f in fileInput:
+            ext = Path(f.filename or "image.png").suffix.lower() or ".png"
+            if ext not in IMAGE_EXTENSIONS:
+                raise PdfError(400, "不支持的图片格式", code="INVALID_IMAGE")
+            path = await save_upload(f, suffix=ext)
+            inputs.append(path)
+            validate_image(path)
 
-        dest = temp_manager.create_temp_file(".pdf")
-        pdf_engine.save_atomic(out, dest, garbage=4, deflate=True)
+        out = fitz.open()
+        try:
+            for path in inputs:
+                try:
+                    if pageSize == "source":
+                        pix = fitz.Pixmap(str(path))
+                        page = out.new_page(width=pix.width, height=pix.height)
+                        pix = None
+                        page.insert_image(page.rect, filename=str(path), keep_proportion=fit)
+                    else:
+                        target = fitz.paper_rect(pageSize)
+                        page = out.new_page(width=target.width, height=target.height)
+                        margin = 36
+                        avail = fitz.Rect(
+                            margin, margin, target.width - margin, target.height - margin
+                        )
+                        page.insert_image(
+                            avail,
+                            filename=str(path),
+                            keep_proportion=fit,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    raise PdfError(422, "图片无法嵌入 PDF", code="INVALID_IMAGE") from exc
+
+            dest = temp_manager.create_temp_file(".pdf")
+            pdf_engine.save_atomic(out, dest, garbage=4, deflate=True)
+        finally:
+            out.close()
+
+        first = Path(fileInput[0].filename or "images").stem
+        return file_response(dest, f"{first}_images.pdf")
     finally:
-        out.close()
         for path in inputs:
             temp_manager.discard(path)
-
-    first = Path(fileInput[0].filename or "images").stem
-    return file_response(dest, f"{first}_images.pdf")

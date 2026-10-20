@@ -37,10 +37,10 @@ set "BACKEND_DIR=%~dp0backend"
 set "FRONTEND_DIR=%~dp0frontend"
 
 echo [1/3] Starting backend on port 8000...
-start "PDF Editor Backend 8000" cmd /k cd /d "%BACKEND_DIR%" ^&^& "%PYTHON%" -m uvicorn app.main:app --port 8000
+start "PDF Editor Backend 8000" cmd /k cd /d "%BACKEND_DIR%" ^&^& "%PYTHON%" -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 echo [2/3] Starting frontend on port 5173...
-start "PDF Editor Frontend 5173" cmd /k cd /d "%FRONTEND_DIR%" ^&^& npm run dev
+start "PDF Editor Frontend 5173" cmd /k cd /d "%FRONTEND_DIR%" ^&^& npm run dev -- --host 127.0.0.1
 
 rem ---------- wait for readiness ----------
 echo [3/3] Waiting for services to become ready...
