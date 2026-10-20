@@ -22,9 +22,10 @@ from .core.errors import (
 )
 from .core.request_middleware import LocalAccessMiddleware, RequestBodyLimitMiddleware
 from .core.tempfile import temp_manager
-from .routers import convert, edit, general, misc
+from .routers import convert, edit, general, jobs, misc
 from .services import libreoffice
 from .services.sessions import session_manager
+from .services.jobs import job_manager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,6 +39,7 @@ async def lifespan(_: FastAPI):
     config.ensure_dirs()
     orphaned_temp = temp_manager.cleanup_orphans()
     orphaned_sessions = session_manager.cleanup_orphans()
+    await job_manager.start()
     if orphaned_temp or orphaned_sessions:
         logger.info(
             "Removed %d orphan temporary entries and %d orphan edit sessions",
@@ -49,12 +51,14 @@ async def lifespan(_: FastAPI):
         while True:
             await asyncio.sleep(600)  # every 10 minutes
             try:
+                jobs = job_manager.cleanup_expired()
                 removed = temp_manager.cleanup_old()
                 sessions = session_manager.cleanup_expired()
                 orphaned_sessions = session_manager.cleanup_orphans()
-                if removed or sessions or orphaned_sessions:
+                if removed or sessions or orphaned_sessions or jobs:
                     logger.info(
-                        "Cleaned up %d expired temp entries, %d sessions, %d orphan sessions",
+                        "Cleaned up %d jobs, %d temp entries, %d sessions, %d orphan sessions",
+                        jobs,
                         removed,
                         sessions,
                         orphaned_sessions,
@@ -62,18 +66,13 @@ async def lifespan(_: FastAPI):
             except Exception:
                 logger.exception("Temporary cleanup pass failed; scheduler will continue")
 
-    async def _lo_warmup() -> None:
-        ok = await libreoffice.warmup()
-        logger.info("LibreOffice warmup: %s", "ok" if ok else "unavailable")
-
     cleanup_task = asyncio.create_task(_cleanup_loop())
-    warmup_task = asyncio.create_task(_lo_warmup())
     logger.info("PDF Editor backend started; temp dir: %s", config.TEMP_DIR)
     try:
         yield
     finally:
         cleanup_task.cancel()
-        warmup_task.cancel()
+        await job_manager.stop()
         session_manager.close_all()
         temp_manager.cleanup_old(0)  # dev shutdown: clear registry
 
@@ -85,7 +84,7 @@ app.add_middleware(
     allow_origins=config.CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "X-Idempotency-Key"],
+    allow_headers=["Content-Type", "Idempotency-Key"],
 )
 app.add_middleware(LocalAccessMiddleware, ui_origin=config.UI_ORIGIN)
 app.add_middleware(RequestBodyLimitMiddleware, max_bytes=config.MAX_UPLOAD_BYTES)
@@ -98,8 +97,14 @@ app.include_router(general.router)
 app.include_router(convert.router)
 app.include_router(misc.router)
 app.include_router(edit.router)
+app.include_router(jobs.router)
 
 
 @app.get("/api/health")
 async def health() -> dict:
-    return {"status": "ok", "libreoffice": libreoffice.soffice_available()}
+    return {"status": "ok"}
+
+
+@app.get("/api/health/ready")
+async def readiness() -> dict:
+    return await libreoffice.readiness_snapshot()

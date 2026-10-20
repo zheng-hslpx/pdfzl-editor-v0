@@ -250,3 +250,17 @@ def test_local_host_and_origin_are_enforced(client):
     bad_host = client.get("/api/health", headers={"Host": "192.168.1.10:8000"})
     assert bad_host.status_code == 403
     assert bad_host.json()["code"] == "LOCAL_ACCESS_ONLY"
+
+
+def test_cors_preflight_allows_idempotency_header(client):
+    response = client.options(
+        "/api/v1/convert/pdf-to-text",
+        headers={
+            "Origin": "http://127.0.0.1:5173",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type,idempotency-key",
+        },
+    )
+    assert response.status_code == 200
+    allowed = response.headers.get("access-control-allow-headers", "").lower()
+    assert "idempotency-key" in allowed

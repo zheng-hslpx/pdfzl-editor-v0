@@ -6,16 +6,17 @@ import json
 import fitz
 import pytest
 
-from conftest import make_sample_pdf, make_zh_pdf
+from conftest import make_sample_pdf, make_zh_pdf, submit_job
 
 
 def _open(client, pdf_path, name="sample.pdf"):
-    r = client.post(
+    result, _ = submit_job(
+        client,
         "/api/v1/edit/open",
         files=[("fileInput", (name, pdf_path.read_bytes(), "application/pdf"))],
     )
-    assert r.status_code == 200
-    return r.json()
+    assert result["state"] == "succeeded", result.get("error")
+    return result["result"]
 
 
 def _find_line(model: dict, page: int, needle: str) -> dict:
@@ -54,11 +55,52 @@ def test_open_returns_text_model(client, sample_pdf):
     assert line["font"] == "helv"
 
 
+def test_editor_commit_preserves_links_forms_bookmarks_and_metadata(client, tmp_path):
+    source_path = tmp_path / "document-objects.pdf"
+    source = fitz.open()
+    page = source.new_page()
+    page.insert_text((72, 100), "PRESERVE OBJECTS")
+    page.insert_link({
+        "kind": fitz.LINK_URI,
+        "from": fitz.Rect(72, 90, 210, 110),
+        "uri": "https://example.invalid/editor-test",
+    })
+    widget = fitz.Widget()
+    widget.field_name = "editor-preserved-field"
+    widget.field_type = fitz.PDF_WIDGET_TYPE_TEXT
+    widget.rect = fitz.Rect(72, 140, 240, 164)
+    widget.field_value = "keep this field"
+    page.add_widget(widget)
+    source.set_metadata({"title": "Editor commit object check", "author": "PDF Editor"})
+    source.set_toc([[1, "Bookmark survives edit", 1]])
+    source.save(source_path)
+    source.close()
+
+    opened = _open(client, source_path, "document-objects.pdf")
+    job, _ = submit_job(
+        client,
+        f"/api/v1/edit/{opened['docId']}/pages/rotate",
+        json={"page": 0, "angle": 90, "expectedRevision": opened["revision"]},
+    )
+    assert job["state"] == "succeeded", job.get("error")
+
+    result = _download(client, opened["docId"])
+    assert result.page_count == 1
+    assert result[0].rotation == 90
+    assert result.metadata["title"] == "Editor commit object check"
+    assert result.get_toc() == [[1, "Bookmark survives edit", 1]]
+    assert len(result[0].get_links()) == 1
+    widgets = list(result[0].widgets() or [])
+    assert len(widgets) == 1
+    assert widgets[0].field_value == "keep this field"
+    result.close()
+
+
 def test_replace_text_roundtrip(client, sample_pdf):
     data = _open(client, sample_pdf)
     doc_id = data["docId"]
     line = _find_line(data["textModel"], 0, "PAGE-1")
-    r = client.post(
+    job, _ = submit_job(client,
         f"/api/v1/edit/{doc_id}/apply",
         json={
             "edits": [
@@ -69,7 +111,7 @@ def test_replace_text_roundtrip(client, sample_pdf):
             "expectedRevision": data["revision"],
         },
     )
-    assert r.status_code == 200
+    assert job["state"] == "succeeded", job.get("error")
     out = _download(client, doc_id)
     text = out[0].get_text()
     assert "REPLACED TEXT" in text
@@ -81,7 +123,7 @@ def test_replace_with_chinese(client, sample_pdf):
     data = _open(client, sample_pdf)
     doc_id = data["docId"]
     line = _find_line(data["textModel"], 0, "HELLO")
-    r = client.post(
+    job, _ = submit_job(client,
         f"/api/v1/edit/{doc_id}/apply",
         json={
             "edits": [
@@ -92,7 +134,7 @@ def test_replace_with_chinese(client, sample_pdf):
             "expectedRevision": data["revision"],
         },
     )
-    assert r.status_code == 200
+    assert job["state"] == "succeeded", job.get("error")
     out = _download(client, doc_id)
     assert "你好世界" in out[0].get_text()
     out.close()
@@ -102,7 +144,7 @@ def test_whiteout_via_empty_text(client, sample_pdf):
     data = _open(client, sample_pdf)
     doc_id = data["docId"]
     line = _find_line(data["textModel"], 0, "PAGE-1")
-    r = client.post(
+    job, _ = submit_job(client,
         f"/api/v1/edit/{doc_id}/apply",
         json={
             "edits": [
@@ -111,7 +153,7 @@ def test_whiteout_via_empty_text(client, sample_pdf):
             "expectedRevision": data["revision"],
         },
     )
-    assert r.status_code == 200
+    assert job["state"] == "succeeded", job.get("error")
     out = _download(client, doc_id)
     assert "PAGE-1" not in out[0].get_text()
     out.close()
@@ -120,13 +162,13 @@ def test_whiteout_via_empty_text(client, sample_pdf):
 def test_add_text_chinese(client, sample_pdf):
     data = _open(client, sample_pdf)
     doc_id = data["docId"]
-    r = client.post(
+    job, _ = submit_job(client,
         f"/api/v1/edit/{doc_id}/text/add",
         json={"expectedRevision": data["revision"], "page": 0,
               "pageId": data["pages"][0]["pageId"], "x": 72, "y": 400,
               "text": "新增的中文文字", "fontSize": 14},
     )
-    assert r.status_code == 200
+    assert job["state"] == "succeeded", job.get("error")
     out = _download(client, doc_id)
     assert "新增的中文文字" in out[0].get_text()
     out.close()
@@ -135,13 +177,13 @@ def test_add_text_chinese(client, sample_pdf):
 def test_add_image(client, sample_pdf, sample_png):
     data = _open(client, sample_pdf)
     doc_id = data["docId"]
-    r = client.post(
+    job, _ = submit_job(client,
         f"/api/v1/edit/{doc_id}/image/add",
         files=[("image", ("stamp.png", sample_png.read_bytes(), "image/png"))],
         data={"page": 0, "x": 100, "y": 500, "w": 120, "h": 80,
               "expectedRevision": data["revision"], "pageId": data["pages"][0]["pageId"]},
     )
-    assert r.status_code == 200
+    assert job["state"] == "succeeded", job.get("error")
     out = _download(client, doc_id)
     assert out.page_count == 3
     out.close()
@@ -155,39 +197,41 @@ def test_invalid_image_does_not_poison_edit_session(client, sample_pdf):
         files=[("image", ("fake.png", b"not an image", "image/png"))],
         data={"page": 0, "x": 100, "y": 500, "w": 120, "h": 80,
               "expectedRevision": data["revision"], "pageId": data["pages"][0]["pageId"]},
+        headers={"Idempotency-Key": "bad-image-upload"},
     )
     assert bad.status_code == 422
     assert bad.json()["code"] == "INVALID_IMAGE"
 
-    good = client.post(
+    good, _ = submit_job(client,
         f"/api/v1/edit/{doc_id}/text/add",
         json={"expectedRevision": data["revision"], "page": 0,
               "pageId": data["pages"][0]["pageId"], "x": 72, "y": 400,
               "text": "session remains usable"},
     )
-    assert good.status_code == 200
+    assert good["state"] == "succeeded"
 
 
 def test_page_rotate_delete_move(client, sample_pdf):
     data = _open(client, sample_pdf)
     doc_id = data["docId"]
 
-    r = client.post(f"/api/v1/edit/{doc_id}/pages/rotate", json={
+    job, _ = submit_job(client, f"/api/v1/edit/{doc_id}/pages/rotate", json={
         "page": 0, "angle": 90, "expectedRevision": data["revision"]
     })
-    assert r.status_code == 200
-    assert r.json()["pages"][0]["rotation"] == 90
+    assert job["state"] == "succeeded"
+    revision = job["result"]["revision"]
+    assert job["result"]["pages"][0]["rotation"] == 90
 
-    r = client.post(f"/api/v1/edit/{doc_id}/pages/delete", json={
-        "pages": [1], "expectedRevision": r.json()["revision"]
+    job, _ = submit_job(client, f"/api/v1/edit/{doc_id}/pages/delete", json={
+        "pages": [1], "expectedRevision": revision
     })
-    assert r.status_code == 200
-    assert r.json()["pageCount"] == 2
+    assert job["state"] == "succeeded"
+    assert job["result"]["pageCount"] == 2
 
-    r = client.post(f"/api/v1/edit/{doc_id}/pages/move", json={
-        "from": 1, "to": 0, "expectedRevision": r.json()["revision"]
+    job, _ = submit_job(client, f"/api/v1/edit/{doc_id}/pages/move", json={
+        "from": 1, "to": 0, "expectedRevision": job["result"]["revision"]
     })
-    assert r.status_code == 200
+    assert job["state"] == "succeeded"
     out = _download(client, doc_id)
     # original page 3 should now be first
     assert "PAGE-3" in out[0].get_text()
@@ -196,11 +240,12 @@ def test_page_rotate_delete_move(client, sample_pdf):
 
 def test_delete_all_pages_rejected(client, sample_pdf):
     data = _open(client, sample_pdf)
-    r = client.post(
+    result, _ = submit_job(client,
         f"/api/v1/edit/{data['docId']}/pages/delete",
         json={"pages": [0, 1, 2], "expectedRevision": data["revision"]},
     )
-    assert r.status_code == 400
+    assert result["state"] == "failed"
+    assert result["error"]["code"] == "INVALID_INPUT"
 
 
 def test_close_invalidates_session(client, sample_pdf):
@@ -233,6 +278,7 @@ def test_stale_revision_and_line_anchor_are_rejected_without_mutation(client, sa
             "expectedRevision": data["revision"] + 1,
             "edits": [_edit_payload(line, 0, "SHOULD NOT WRITE")],
         },
+        headers={"Idempotency-Key": "stale-revision"},
     )
     assert stale.status_code == 409
     assert stale.json()["code"] == "REVISION_CONFLICT"
@@ -247,7 +293,7 @@ def test_stale_revision_and_line_anchor_are_rejected_without_mutation(client, sa
                 "bbox": [float("nan"), 2, 3, 4],
             }],
         }),
-        headers={"content-type": "application/json"},
+        headers={"content-type": "application/json", "Idempotency-Key": "invalid-bbox"},
     )
     assert invalid_bbox.status_code == 422
     assert invalid_bbox.json()["code"] == "INVALID_INPUT"
@@ -258,6 +304,7 @@ def test_stale_revision_and_line_anchor_are_rejected_without_mutation(client, sa
     response = client.post(
         f"/api/v1/edit/{doc_id}/apply",
         json={"expectedRevision": data["revision"], "edits": [bad_anchor]},
+        headers={"Idempotency-Key": "bad-line-anchor"},
     )
     assert response.status_code == 409
     assert response.json()["code"] == "REVISION_CONFLICT"
@@ -268,13 +315,13 @@ def test_stale_revision_and_line_anchor_are_rejected_without_mutation(client, sa
 def test_rotated_pages_reject_coordinate_writes(client, sample_pdf, sample_png, angle):
     data = _open(client, sample_pdf)
     doc_id = data["docId"]
-    rotated = client.post(
+    rotated, _ = submit_job(client,
         f"/api/v1/edit/{doc_id}/pages/rotate",
         json={"page": 0, "angle": angle, "expectedRevision": data["revision"]},
     )
-    assert rotated.status_code == 200
-    revision = rotated.json()["revision"]
-    page_id = rotated.json()["pages"][0]["pageId"]
+    assert rotated["state"] == "succeeded"
+    revision = rotated["result"]["revision"]
+    page_id = rotated["result"]["pages"][0]["pageId"]
     before = client.get(f"/api/v1/edit/{doc_id}/download").content
 
     add_text = client.post(
@@ -287,6 +334,7 @@ def test_rotated_pages_reject_coordinate_writes(client, sample_pdf, sample_png, 
             "y": 50,
             "text": "must not be written",
         },
+        headers={"Idempotency-Key": f"rotated-text-{angle}"},
     )
     assert add_text.status_code == 422
     assert add_text.json()["code"] == "ROTATED_PAGE_UNSUPPORTED"
@@ -300,14 +348,17 @@ def test_rotated_pages_reject_coordinate_writes(client, sample_pdf, sample_png, 
                 "bbox": [10, 10, 40, 40], "text": "",
             }],
         },
+        headers={"Idempotency-Key": f"rotated-cover-{angle}"},
     )
     assert cover.status_code == 422
+    assert cover.json()["code"] == "ROTATED_PAGE_UNSUPPORTED"
 
     image = client.post(
         f"/api/v1/edit/{doc_id}/image/add",
         files=[("image", ("stamp.png", sample_png.read_bytes(), "image/png"))],
         data={"page": 0, "x": 100, "y": 500, "w": 120, "h": 80,
               "expectedRevision": revision, "pageId": page_id},
+        headers={"Idempotency-Key": f"rotated-image-{angle}"},
     )
     assert image.status_code == 422
     assert image.json()["code"] == "ROTATED_PAGE_UNSUPPORTED"
@@ -323,6 +374,7 @@ def test_open_invalid_pdf(client, tmp_path):
     r = client.post(
         "/api/v1/edit/open",
         files=[("fileInput", ("bad.pdf", bad.read_bytes(), "application/pdf"))],
+        headers={"Idempotency-Key": "invalid-pdf-open"},
     )
     assert r.status_code == 400
     assert set(config.TEMP_DIR.glob("pdfeditor-*")) == before

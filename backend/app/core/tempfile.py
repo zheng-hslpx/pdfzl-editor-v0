@@ -9,6 +9,7 @@ Patterns ported from Stirling-PDF (Java):
 """
 from __future__ import annotations
 
+import hashlib
 import shutil
 import logging
 import threading
@@ -21,7 +22,6 @@ from typing import Iterator
 from .. import config
 from .errors import PdfError
 from .input_validation import validate_pdf
-from .input_validation import validate_pdf
 
 logger = logging.getLogger("pdf_editor.temp")
 
@@ -33,6 +33,8 @@ class TempFileManager:
         self.base_dir = base_dir
         self.ttl_hours = ttl_hours
         self._registry: dict[Path, float] = {}
+        self._digests: dict[Path, str] = {}
+        self._page_counts: dict[Path, int] = {}
         self._lock = threading.RLock()
         base_dir.mkdir(parents=True, exist_ok=True)
 
@@ -57,6 +59,34 @@ class TempFileManager:
     def unregister(self, path: Path) -> None:
         with self._lock:
             self._registry.pop(path, None)
+            self._digests.pop(path, None)
+            self._page_counts.pop(path, None)
+
+    def set_digest(self, path: Path, digest: str) -> None:
+        with self._lock:
+            self._digests[path] = digest
+
+    def get_digest(self, path: Path) -> str:
+        with self._lock:
+            cached = self._digests.get(path)
+        if cached is not None:
+            return cached
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def set_page_count(self, path: Path, page_count: int) -> None:
+        with self._lock:
+            self._page_counts[path] = page_count
+
+    def get_page_count(self, path: Path) -> int:
+        with self._lock:
+            count = self._page_counts.get(path)
+        if count is None:
+            raise ValueError("temporary PDF page count is unavailable")
+        return count
 
     # -- cleanup ------------------------------------------------------
     def cleanup_old(self, max_age_hours: float | None = None) -> int:
@@ -143,10 +173,11 @@ def temp_dir(prefix: str = "pdfeditor-") -> Iterator[Path]:
         temp_manager.discard(path)
 
 
-async def save_upload(upload, suffix: str = ".pdf") -> Path:
+async def save_upload(upload, suffix: str = ".pdf", *, allow_encrypted: bool = False) -> Path:
     """Stream an UploadFile into a registered temp file (1 MiB chunks)."""
     dest = temp_manager.create_temp_file(suffix)
     size = 0
+    digest = hashlib.sha256()
     try:
         with open(dest, "wb") as fh:
             while chunk := await upload.read(1024 * 1024):
@@ -158,10 +189,12 @@ async def save_upload(upload, suffix: str = ".pdf") -> Path:
                         code="UPLOAD_TOO_LARGE",
                     )
                 fh.write(chunk)
+                digest.update(chunk)
         if suffix.lower() == ".pdf":
-            validate_pdf(dest)
-        if suffix.lower() == ".pdf":
-            validate_pdf(dest)
+            page_count = validate_pdf(dest, allow_encrypted=allow_encrypted)
+            if page_count is not None:
+                temp_manager.set_page_count(dest, page_count)
+        temp_manager.set_digest(dest, digest.hexdigest())
     except BaseException:
         temp_manager.discard(dest)
         raise

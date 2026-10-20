@@ -10,12 +10,12 @@ import zipfile
 from pathlib import Path
 
 import fitz
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import APIRouter, File, Form, Header, UploadFile
+from fastapi.responses import JSONResponse
 
-from ..core import pdf_engine
 from ..core.errors import PdfError
-from ..core.responses import file_response
 from ..core.tempfile import save_upload, temp_manager
+from ..services.jobs import job_manager
 
 router = APIRouter(prefix="/api/v1/general", tags=["general"])
 
@@ -106,6 +106,7 @@ def _parse_segments(spec: str, total: int) -> list[tuple[list[int], str]]:
 async def merge_pdfs(
     fileInput: list[UploadFile] = File(...),
     fileOrder: str = Form(default=""),
+    idempotency_key: str = Header(alias="Idempotency-Key"),
 ):
     if len(fileInput) < 2:
         raise PdfError(400, "合并至少需要 2 个 PDF 文件")
@@ -113,75 +114,59 @@ async def merge_pdfs(
     order = _resolve_order(fileOrder, names)
 
     inputs = []
-    dest = None
-    response_ready = False
     try:
         for upload in fileInput:
             inputs.append(await save_upload(upload))
-        ordered = [inputs[i] for i in order]
-        out = fitz.open()
-        toc: list[list] = []
-        try:
-            for path in ordered:
-                src = pdf_engine.open_pdf(path)
-                try:
-                    start = out.page_count
-                    out.insert_pdf(src)
-                    for level, title, page in src.get_toc():
-                        toc.append([level, title, page + start])
-                finally:
-                    src.close()
-            if toc:
-                out.set_toc(toc)
-            dest = temp_manager.create_temp_file(".pdf")
-            pdf_engine.save_atomic(out, dest, garbage=4, deflate=True)
-        finally:
-            out.close()
-        response = file_response(dest, f"{_base_name(names[order[0]])}_merged.pdf")
-        response_ready = True
-        return response
-    finally:
+        payload = {
+            "source_paths": [str(path) for path in inputs],
+            "order": order,
+            "names": names,
+        }
+        request_hash = job_manager.fingerprint(
+            "general_merge", payload, [temp_manager.get_digest(path) for path in inputs]
+        )
+        job = await job_manager.submit(
+            "general_merge",
+            payload,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            input_paths=inputs,
+        )
+        return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
+    except BaseException:
         for path in inputs:
             temp_manager.discard(path)
-        if dest is not None and not response_ready:
-            temp_manager.discard(dest)
+        raise
 
 
 @router.post("/split-pages", summary="按页码范围拆分（输出 ZIP）")
 async def split_pages(
     fileInput: UploadFile = File(...),
     pageRanges: str = Form(default=""),
+    idempotency_key: str = Header(alias="Idempotency-Key"),
 ):
     src_path = await save_upload(fileInput)
     base = _base_name(fileInput.filename)
-    doc = None
-    zip_path = None
-    response_ready = False
     try:
-        doc = pdf_engine.open_pdf(src_path)
-        total = doc.page_count
-        segments = _parse_segments(pageRanges, total)
-        zip_path = temp_manager.create_temp_file(".zip")
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for pages, label in segments:
-                seg = fitz.open()
-                try:
-                    seg.insert_pdf(doc, from_page=pages[0], to_page=pages[-1])
-                    seg_bytes = seg.tobytes(deflate=True)
-                finally:
-                    seg.close()
-                zf.writestr(f"{base}_pages_{label}.pdf", seg_bytes)
-        response = file_response(
-            zip_path, f"{base}_split.zip", media_type="application/zip"
+        payload = {
+            "source_path": str(src_path),
+            "filename": fileInput.filename or "document.pdf",
+            "page_ranges": pageRanges,
+        }
+        request_hash = job_manager.fingerprint(
+            "general_split", payload, [temp_manager.get_digest(src_path)]
         )
-        response_ready = True
-        return response
-    finally:
-        if doc is not None:
-            doc.close()
+        job = await job_manager.submit(
+            "general_split",
+            payload,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            input_paths=[src_path],
+        )
+        return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
+    except BaseException:
         temp_manager.discard(src_path)
-        if zip_path is not None and not response_ready:
-            temp_manager.discard(zip_path)
+        raise
 
 
 @router.post("/rotate", summary="旋转页面")
@@ -189,67 +174,78 @@ async def rotate(
     fileInput: UploadFile = File(...),
     angle: int = Form(...),
     pages: str = Form(default="all"),
+    idempotency_key: str = Header(alias="Idempotency-Key"),
 ):
     if angle not in (90, 180, 270):
         raise PdfError(400, "旋转角度仅支持 90 / 180 / 270")
     src_path = await save_upload(fileInput)
-    doc = pdf_engine.open_pdf(src_path)
     try:
-        indices = pdf_engine.parse_page_ranges(pages, doc.page_count)
-        for i in indices:
-            doc[i].set_rotation((doc[i].rotation + angle) % 360)
-        dest = temp_manager.create_temp_file(".pdf")
-        pdf_engine.save_atomic(doc, dest, garbage=4, deflate=True)
-    finally:
-        doc.close()
+        payload = {
+            "source_path": str(src_path),
+            "filename": fileInput.filename or "document.pdf",
+            "angle": angle,
+            "pages": pages,
+        }
+        request_hash = job_manager.fingerprint(
+            "general_rotate", payload, [temp_manager.get_digest(src_path)]
+        )
+        job = await job_manager.submit(
+            "general_rotate", payload, idempotency_key=idempotency_key,
+            request_hash=request_hash, input_paths=[src_path],
+        )
+        return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
+    except BaseException:
         temp_manager.discard(src_path)
-
-    return file_response(dest, f"{_base_name(fileInput.filename)}_rotated.pdf")
+        raise
 
 
 @router.post("/remove-pages", summary="删除指定页")
 async def remove_pages(
     fileInput: UploadFile = File(...),
     pages: str = Form(...),
+    idempotency_key: str = Header(alias="Idempotency-Key"),
 ):
     src_path = await save_upload(fileInput)
-    doc = pdf_engine.open_pdf(src_path)
     try:
-        to_remove = set(pdf_engine.parse_page_ranges(pages, doc.page_count))
-        if len(to_remove) >= doc.page_count:
-            raise PdfError(400, "不能删除全部页面")
-        doc.select([i for i in range(doc.page_count) if i not in to_remove])
-        dest = temp_manager.create_temp_file(".pdf")
-        pdf_engine.save_atomic(doc, dest, garbage=4, deflate=True)
-    finally:
-        doc.close()
+        payload = {
+            "source_path": str(src_path),
+            "filename": fileInput.filename or "document.pdf",
+            "pages": pages,
+        }
+        request_hash = job_manager.fingerprint(
+            "general_remove", payload, [temp_manager.get_digest(src_path)]
+        )
+        job = await job_manager.submit(
+            "general_remove", payload, idempotency_key=idempotency_key,
+            request_hash=request_hash, input_paths=[src_path],
+        )
+        return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
+    except BaseException:
         temp_manager.discard(src_path)
-
-    return file_response(dest, f"{_base_name(fileInput.filename)}_trimmed.pdf")
+        raise
 
 
 @router.post("/reorder-pages", summary="重排页面顺序")
 async def reorder_pages(
     fileInput: UploadFile = File(...),
     pageOrder: str = Form(...),
+    idempotency_key: str = Header(alias="Idempotency-Key"),
 ):
     src_path = await save_upload(fileInput)
-    doc = pdf_engine.open_pdf(src_path)
     try:
-        total = doc.page_count
-        try:
-            order = [int(t) - 1 for t in pageOrder.replace("\n", ",").split(",") if t.strip()]
-        except ValueError as exc:
-            raise PdfError(400, f"无效的页序: {pageOrder}") from exc
-        if sorted(order) != list(range(total)):
-            raise PdfError(
-                400, f"页序必须是 1..{total} 的一个排列（当前共 {len(order)} 项）"
-            )
-        doc.select(order)
-        dest = temp_manager.create_temp_file(".pdf")
-        pdf_engine.save_atomic(doc, dest, garbage=4, deflate=True)
-    finally:
-        doc.close()
+        payload = {
+            "source_path": str(src_path),
+            "filename": fileInput.filename or "document.pdf",
+            "page_order": pageOrder,
+        }
+        request_hash = job_manager.fingerprint(
+            "general_reorder", payload, [temp_manager.get_digest(src_path)]
+        )
+        job = await job_manager.submit(
+            "general_reorder", payload, idempotency_key=idempotency_key,
+            request_hash=request_hash, input_paths=[src_path],
+        )
+        return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
+    except BaseException:
         temp_manager.discard(src_path)
-
-    return file_response(dest, f"{_base_name(fileInput.filename)}_reordered.pdf")
+        raise

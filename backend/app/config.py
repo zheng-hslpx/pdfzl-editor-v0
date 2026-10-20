@@ -46,6 +46,17 @@ LO_READY_CACHE_SECONDS: float = float(
     os.environ.get("PDF_EDITOR_LO_READY_CACHE_SECONDS", "300")
 )
 
+JOB_TIMEOUT_SECONDS: float = float(os.environ.get("PDF_EDITOR_JOB_TIMEOUT_SECONDS", "900"))
+JOB_MEMORY_LIMIT_BYTES: int = int(
+    os.environ.get("PDF_EDITOR_JOB_MEMORY_MB", "2048")
+) * 1024 * 1024
+JOB_QUEUE_CAPACITY: int = 1
+JOB_RESULT_TTL_HOURS: float = float(
+    os.environ.get("PDF_EDITOR_JOB_RESULT_TTL_HOURS", "2")
+)
+PREVIEW_PAGE_PIXELS: int = 24_000_000
+RENDER_BATCH_PIXELS: int = 160_000_000
+
 
 def ensure_dirs() -> None:
     TEMP_DIR.mkdir(parents=True, exist_ok=True)

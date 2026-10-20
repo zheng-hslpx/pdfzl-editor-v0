@@ -55,7 +55,13 @@ class SessionManager:
         session_dir.mkdir(parents=True, exist_ok=True)
         dest = session_dir / "document.pdf"
         try:
-            shutil.copy2(src, dest)
+            # Upload temp files and sessions live under TEMP_DIR on the same
+            # volume; transfer ownership atomically instead of blocking the
+            # API loop while duplicating a potentially 600 MiB file.
+            if Path(src).resolve().drive.lower() == dest.resolve().drive.lower():
+                os.replace(src, dest)
+            else:
+                shutil.copy2(src, dest)
         except BaseException:
             if not self._delete_dir(session_dir):
                 self._orphan_dirs.add(session_dir)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 import uuid
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from PIL import Image
 _PYTEST_TEMP_ROOT = (
     Path(__file__).resolve().parents[1]
     / ".pytest-temp"
-    / f"run-{os.getpid()}-{uuid.uuid4().hex}"
+    / f"r{os.getpid():x}-{uuid.uuid4().hex[:8]}"
     / "app"
 )
 _PYTEST_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -94,6 +95,36 @@ def temp_dir_path():
     from app import config
 
     return config.TEMP_DIR
+
+
+def submit_job(client, url: str, *, files=None, data=None, json=None, timeout=30):
+    response = client.post(
+        url,
+        files=files,
+        data=data,
+        json=json,
+        headers={"Idempotency-Key": uuid.uuid4().hex},
+    )
+    assert response.status_code == 202, response.text
+    job_id = response.json()["jobId"]
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = client.get(f"/api/v1/jobs/{job_id}")
+        assert status.status_code == 200, status.text
+        result = status.json()
+        if result["state"] in {"succeeded", "failed", "cancelled"}:
+            file_response = (
+                client.get(result["resultUrl"]) if result.get("resultUrl") else None
+            )
+            return result, file_response
+        time.sleep(0.025)
+    raise AssertionError(f"job {job_id} did not finish within {timeout}s")
+
+
+def successful_job(client, url: str, **kwargs):
+    result, file_response = submit_job(client, url, **kwargs)
+    assert result["state"] == "succeeded", result.get("error")
+    return result, file_response
 
 
 @pytest.fixture(scope="session", autouse=True)

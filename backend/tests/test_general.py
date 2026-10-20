@@ -1,6 +1,9 @@
 """Tests for /api/v1/general/* page-operation endpoints."""
 from __future__ import annotations
 
+import asyncio
+import io
+import time
 import zipfile
 
 import fitz
@@ -8,8 +11,9 @@ import pytest
 
 from app.core.errors import PdfError
 from app.core.pdf_engine import parse_page_ranges
+from app.services import libreoffice
 
-from conftest import make_sample_pdf
+from conftest import make_sample_pdf, successful_job, submit_job
 
 
 def _open(content: bytes) -> fitz.Document:
@@ -50,7 +54,41 @@ def test_parse_ranges_invalid():
 def test_health(client):
     r = client.get("/api/health")
     assert r.status_code == 200
-    assert r.json()["status"] == "ok"
+    assert r.json() == {"status": "ok"}
+
+
+def test_readiness_returns_cached_state_without_waiting_for_probe(client, monkeypatch):
+    calls = 0
+
+    async def delayed_probe():
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.25)
+        return True
+
+    monkeypatch.setattr(libreoffice, "soffice_available", lambda: True)
+    monkeypatch.setattr(libreoffice, "_probe_cache", None)
+    monkeypatch.setattr(libreoffice, "_probe_checked_at", 0.0)
+    monkeypatch.setattr(libreoffice, "_probe_task", None)
+    monkeypatch.setattr(libreoffice, "_probe_functional", delayed_probe)
+
+    start = time.monotonic()
+    first = client.get("/api/health/ready")
+    elapsed = time.monotonic() - start
+    assert first.status_code == 200
+    assert elapsed < 0.2
+    assert first.json()["status"] == "unknown"
+    assert first.json()["checking"] is True
+
+    again = client.get("/api/health/ready")
+    assert again.json()["checking"] is True
+    assert calls <= 1  # the probe is asynchronous and single-flight
+
+    time.sleep(0.35)
+    ready = client.get("/api/health/ready")
+    assert ready.json()["status"] == "ready"
+    assert ready.json()["checking"] is False
+    assert calls == 1
 
 
 # ---------------------------------------------------------------------------
@@ -63,11 +101,10 @@ def _upload(name: str, path) -> tuple:
 
 def test_merge_two_pdfs(client, sample_pdf, tmp_path):
     second = make_sample_pdf(tmp_path / "second.pdf", pages=1)
-    r = client.post(
+    _, r = successful_job(client,
         "/api/v1/general/merge-pdfs",
         files=[_upload("a.pdf", sample_pdf), _upload("b.pdf", second)],
     )
-    assert r.status_code == 200
     assert "attachment" in r.headers["content-disposition"]
     out = _open(r.content)
     assert out.page_count == 4
@@ -82,12 +119,11 @@ def test_merge_with_file_order(client, sample_pdf, tmp_path):
     doc.new_page().insert_text((72, 100), "SECOND FILE", fontsize=14)
     doc.save(str(second))
     doc.close()
-    r = client.post(
+    _, r = successful_job(client,
         "/api/v1/general/merge-pdfs",
         files=[_upload("a.pdf", sample_pdf), _upload("b.pdf", second)],
         data={"fileOrder": "b.pdf,a.pdf"},
     )
-    assert r.status_code == 200
     out = _open(r.content)
     assert "SECOND FILE" in out[0].get_text()  # b.pdf's page first
     assert "PAGE-1" in out[1].get_text()  # then a.pdf
@@ -96,17 +132,17 @@ def test_merge_with_file_order(client, sample_pdf, tmp_path):
 
 def test_merge_needs_two_files(client, sample_pdf):
     r = client.post(
-        "/api/v1/general/merge-pdfs", files=[_upload("a.pdf", sample_pdf)]
+        "/api/v1/general/merge-pdfs", files=[_upload("a.pdf", sample_pdf)],
+        headers={"Idempotency-Key": "merge-one-file"},
     )
     assert r.status_code == 400
 
 
 def test_merge_chinese_roundtrip(client, zh_pdf, sample_pdf):
-    r = client.post(
+    _, r = successful_job(client,
         "/api/v1/general/merge-pdfs",
         files=[_upload("zh.pdf", zh_pdf), _upload("a.pdf", sample_pdf)],
     )
-    assert r.status_code == 200
     out = _open(r.content)
     assert "你好世界" in _full_text(out)
     out.close()
@@ -117,12 +153,11 @@ def test_merge_chinese_roundtrip(client, zh_pdf, sample_pdf):
 # ---------------------------------------------------------------------------
 
 def test_split_by_ranges(client, sample_pdf):
-    r = client.post(
+    _, r = successful_job(client,
         "/api/v1/general/split-pages",
         files=[_upload("sample.pdf", sample_pdf)],
         data={"pageRanges": "1,2-3"},
     )
-    assert r.status_code == 200
     assert r.headers["content-type"] == "application/zip"
     with zipfile.ZipFile(__import__("io").BytesIO(r.content)) as zf:
         names = zf.namelist()
@@ -132,12 +167,11 @@ def test_split_by_ranges(client, sample_pdf):
 
 
 def test_split_all(client, sample_pdf):
-    r = client.post(
+    _, r = successful_job(client,
         "/api/v1/general/split-pages",
         files=[_upload("sample.pdf", sample_pdf)],
         data={"pageRanges": "all"},
     )
-    assert r.status_code == 200
     with zipfile.ZipFile(__import__("io").BytesIO(r.content)) as zf:
         assert zf.namelist() == ["sample_pages_all.pdf"]
         assert _open(zf.read("sample_pages_all.pdf")).page_count == 3
@@ -145,12 +179,13 @@ def test_split_all(client, sample_pdf):
 
 @pytest.mark.parametrize("bad", ["", "5", "2-1", "abc"])
 def test_split_invalid_ranges(client, sample_pdf, bad):
-    r = client.post(
+    result, _ = submit_job(client,
         "/api/v1/general/split-pages",
         files=[_upload("sample.pdf", sample_pdf)],
         data={"pageRanges": bad},
     )
-    assert r.status_code == 400
+    assert result["state"] == "failed"
+    assert result["error"]["code"] == "INVALID_INPUT"
 
 
 # ---------------------------------------------------------------------------
@@ -158,12 +193,11 @@ def test_split_invalid_ranges(client, sample_pdf, bad):
 # ---------------------------------------------------------------------------
 
 def test_rotate(client, sample_pdf):
-    r = client.post(
+    _, r = successful_job(client,
         "/api/v1/general/rotate",
         files=[_upload("sample.pdf", sample_pdf)],
         data={"angle": 90, "pages": "1"},
     )
-    assert r.status_code == 200
     out = _open(r.content)
     assert out[0].rotation == 90
     assert out[1].rotation == 0
@@ -175,17 +209,17 @@ def test_rotate_bad_angle(client, sample_pdf):
         "/api/v1/general/rotate",
         files=[_upload("sample.pdf", sample_pdf)],
         data={"angle": 45},
+        headers={"Idempotency-Key": "rotate-bad-angle"},
     )
     assert r.status_code == 400
 
 
 def test_remove_pages(client, sample_pdf):
-    r = client.post(
+    _, r = successful_job(client,
         "/api/v1/general/remove-pages",
         files=[_upload("sample.pdf", sample_pdf)],
         data={"pages": "2"},
     )
-    assert r.status_code == 200
     out = _open(r.content)
     assert out.page_count == 2
     text = _full_text(out)
@@ -194,21 +228,57 @@ def test_remove_pages(client, sample_pdf):
 
 
 def test_remove_all_pages_rejected(client, sample_pdf):
-    r = client.post(
+    result, _ = submit_job(client,
         "/api/v1/general/remove-pages",
         files=[_upload("sample.pdf", sample_pdf)],
         data={"pages": "all"},
     )
-    assert r.status_code == 400
+    assert result["state"] == "failed"
+    assert result["error"]["code"] == "INVALID_INPUT"
+
+
+def test_split_preserves_metadata_bookmarks_and_unique_names(client, tmp_path):
+    source = fitz.open()
+    for number in range(1, 5):
+        page = source.new_page()
+        page.insert_text((72, 72), f"SOURCE-PAGE-{number}")
+    source.set_metadata({"title": "Split metadata test", "author": "PDF Editor"})
+    source.set_toc([[1, "Second page bookmark", 2], [1, "Fourth page bookmark", 4]])
+    input_path = tmp_path / "bookmark-source.pdf"
+    source.save(input_path)
+    source.close()
+
+    _, response = successful_job(
+        client,
+        "/api/v1/general/split-pages",
+        files=[_upload("bookmark-source.pdf", input_path)],
+        data={"pageRanges": "2-3,4,4"},
+    )
+
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        names = archive.namelist()
+        assert names == [
+            "bookmark-source_pages_2-3.pdf",
+            "bookmark-source_pages_4.pdf",
+            "bookmark-source_pages_4_3.pdf",
+        ]
+        first = fitz.open(stream=archive.read(names[0]), filetype="pdf")
+        assert first.page_count == 2
+        assert first.metadata["title"] == "Split metadata test"
+        assert first.get_toc() == [[1, "Second page bookmark", 1]]
+        first.close()
+        second = fitz.open(stream=archive.read(names[1]), filetype="pdf")
+        assert second.page_count == 1
+        assert second.get_toc() == [[1, "Fourth page bookmark", 1]]
+        second.close()
 
 
 def test_reorder_pages(client, sample_pdf):
-    r = client.post(
+    _, r = successful_job(client,
         "/api/v1/general/reorder-pages",
         files=[_upload("sample.pdf", sample_pdf)],
         data={"pageOrder": "3,1,2"},
     )
-    assert r.status_code == 200
     out = _open(r.content)
     assert "PAGE-3" in out[0].get_text()
     assert "PAGE-1" in out[1].get_text()
@@ -217,12 +287,13 @@ def test_reorder_pages(client, sample_pdf):
 
 
 def test_reorder_invalid_permutation(client, sample_pdf):
-    r = client.post(
+    result, _ = submit_job(client,
         "/api/v1/general/reorder-pages",
         files=[_upload("sample.pdf", sample_pdf)],
         data={"pageOrder": "1,2"},
     )
-    assert r.status_code == 400
+    assert result["state"] == "failed"
+    assert result["error"]["code"] == "INVALID_INPUT"
 
 
 # ---------------------------------------------------------------------------
@@ -230,11 +301,10 @@ def test_reorder_invalid_permutation(client, sample_pdf):
 # ---------------------------------------------------------------------------
 
 def test_no_temp_residue(client, sample_pdf, temp_dir_path):
-    before = set(temp_dir_path.iterdir()) if temp_dir_path.exists() else set()
-    r = client.post(
+    before = set(temp_dir_path.glob("pdfeditor-*")) if temp_dir_path.exists() else set()
+    _, _ = successful_job(client,
         "/api/v1/general/merge-pdfs",
         files=[_upload("a.pdf", sample_pdf), _upload("b.pdf", sample_pdf)],
     )
-    assert r.status_code == 200
-    after = set(temp_dir_path.iterdir()) if temp_dir_path.exists() else set()
+    after = set(temp_dir_path.glob("pdfeditor-*")) if temp_dir_path.exists() else set()
     assert after == before

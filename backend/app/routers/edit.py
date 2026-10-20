@@ -22,7 +22,8 @@ import math
 from pathlib import Path
 
 import fitz
-from fastapi import APIRouter, File, Form, Query, UploadFile
+from fastapi import APIRouter, File, Form, Header, Query, UploadFile
+from fastapi.responses import JSONResponse
 
 from ..core import pdf_engine
 from ..core.errors import PdfError
@@ -30,6 +31,7 @@ from ..core.input_validation import validate_image
 from ..core.responses import file_response
 from ..core.tempfile import save_upload, temp_manager
 from ..services.sessions import session_manager
+from ..services.jobs import job_manager
 from ..schemas import (
     AddTextRequest,
     ApplyEditsRequest,
@@ -63,50 +65,55 @@ def _line_color(color_int: int) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
+def extract_page_text_model(doc: fitz.Document, pno: int, page_id: str) -> dict:
+    """Extract editable text for one page without scanning the full document."""
+    page = doc[pno]
+    lines: list[dict] = []
+    for block in page.get_text("dict")["blocks"]:
+        if block.get("type") != 0:
+            continue
+        for line in block["lines"]:
+            spans = [s for s in line["spans"] if s.get("text")]
+            if not spans:
+                continue
+            text = "".join(s["text"] for s in spans)
+            if not text.strip():
+                continue
+            first = spans[0]
+            lines.append(
+                {
+                    "id": f"{page_id}:l{len(lines)}",
+                    "pageId": page_id,
+                    "originalHash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    "bbox": [round(v, 2) for v in line["bbox"]],
+                    "fontSize": round(float(first.get("size", 12)), 1),
+                    "font": _map_font(str(first.get("font", "")), text),
+                    "color": _line_color(int(first.get("color", 0))),
+                    "text": text,
+                }
+            )
+    return {
+        "page": pno,
+        "pageId": page_id,
+        "width": round(page.rect.width, 2),
+        "height": round(page.rect.height, 2),
+        "rotation": page.rotation,
+        "lines": lines,
+    }
+
+
 def extract_text_model(
     doc: fitz.Document, page_ids: list[str] | None = None
 ) -> list[dict]:
     """Extract line-level editable units per page."""
-    pages: list[dict] = []
-    for pno in range(doc.page_count):
-        page = doc[pno]
-        page_id = page_ids[pno] if page_ids and pno < len(page_ids) else f"page-{pno}"
-        lines: list[dict] = []
-        for block in page.get_text("dict")["blocks"]:
-            if block.get("type") != 0:
-                continue  # image block
-            for line in block["lines"]:
-                spans = [s for s in line["spans"] if s.get("text")]
-                if not spans:
-                    continue
-                text = "".join(s["text"] for s in spans)
-                if not text.strip():
-                    continue
-                bbox = line["bbox"]
-                first = spans[0]
-                lines.append(
-                    {
-                        "id": f"{page_id}:l{len(lines)}",
-                        "pageId": page_id,
-                        "originalHash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-                        "bbox": [round(v, 2) for v in bbox],
-                        "fontSize": round(float(first.get("size", 12)), 1),
-                        "font": _map_font(str(first.get("font", "")), text),
-                        "color": _line_color(int(first.get("color", 0))),
-                        "text": text,
-                    }
-                )
-        pages.append(
-            {
-                "page": pno,
-                "pageId": page_id,
-                "width": round(page.rect.width, 2),
-                "height": round(page.rect.height, 2),
-                "rotation": page.rotation,
-                "lines": lines,
-            }
+    return [
+        extract_page_text_model(
+            doc,
+            pno,
+            page_ids[pno] if page_ids and pno < len(page_ids) else f"page-{pno}",
         )
-    return pages
+        for pno in range(doc.page_count)
+    ]
 
 
 def _page_meta(doc: fitz.Document, page_ids: list[str] | None = None) -> list[dict]:
@@ -155,7 +162,9 @@ def _check_page(session, page_no: int, page_id: str, doc: fitz.Document) -> fitz
 
 def _check_line_anchor(session, doc: fitz.Document, edit) -> None:
     page = _check_page(session, edit.page, edit.pageId or "", doc)
-    page_model = extract_text_model(doc, session.page_ids)[edit.page]
+    if edit.kind == "cover":
+        return
+    page_model = extract_page_text_model(doc, edit.page, edit.pageId or "")
     line = next((item for item in page_model["lines"] if item["id"] == edit.lineId), None)
     if (
         line is None
@@ -166,142 +175,135 @@ def _check_line_anchor(session, doc: fitz.Document, edit) -> None:
         raise PdfError(409, "文本行已变化，请重新定位草稿", code="REVISION_CONFLICT")
 
 
+def _ensure_session_writable(session, expected_revision: int) -> None:
+    _check_revision(session, expected_revision)
+    if session.pending_job_id is not None:
+        raise PdfError(409, "文档修改任务仍在执行", code="SESSION_BUSY")
+
+
+def _preflight_page_write(
+    session, expected_revision: int, page_no: int, page_id: str,
+    rect: fitz.Rect | None = None,
+) -> None:
+    """Keep stale revision, page identity, and rotation errors as HTTP 4xx."""
+    with session.lock:
+        _ensure_session_writable(session, expected_revision)
+        doc = _load_session_pdf(session.id)
+        try:
+            page = _check_page(session, page_no, page_id, doc)
+            if rect is not None and not page.rect.contains(rect):
+                raise PdfError(422, "编辑区域超出页面范围", code="INVALID_BBOX")
+        finally:
+            doc.close()
+
+
+def _preflight_edits(session, payload: ApplyEditsRequest) -> None:
+    with session.lock:
+        _ensure_session_writable(session, payload.expectedRevision)
+        doc = _load_session_pdf(session.id)
+        try:
+            for edit in payload.edits:
+                _check_line_anchor(session, doc, edit)
+                if not doc[edit.page].rect.contains(fitz.Rect(edit.bbox)):
+                    raise PdfError(422, "编辑区域超出页面范围", code="INVALID_BBOX")
+        finally:
+            doc.close()
+
+
 # ---------------------------------------------------------------------------
 # endpoints
 # ---------------------------------------------------------------------------
 
 @router.post("/open", summary="打开 PDF 进入编辑会话")
-async def open_document(fileInput: UploadFile = File(...)):
+async def open_document(
+    fileInput: UploadFile = File(...),
+    idempotency_key: str = Header(alias="Idempotency-Key"),
+):
     src_path = await save_upload(fileInput)
     session = None
     try:
-        doc = pdf_engine.open_pdf(src_path)
-        try:
-            page_count = doc.page_count
-        finally:
-            doc.close()
+        digest = temp_manager.get_digest(src_path)
+        page_count = temp_manager.get_page_count(src_path)
         session = session_manager.create(
             src_path, fileInput.filename or "document.pdf", page_count
         )
-        doc = pdf_engine.open_pdf(session.path)
-        try:
-            model = extract_text_model(doc, session.page_ids)
-            meta = _page_meta(doc, session.page_ids)
-        finally:
-            doc.close()
+        temp_manager.discard(src_path)
+        payload = {
+            "source_path": str(session.path),
+            "page_ids": list(session.page_ids),
+            "docId": session.id,
+            "originalName": session.original_name,
+            "revision": session.revision,
+        }
+        request_hash = job_manager.fingerprint(
+            "editor_open", {"originalName": session.original_name}, [digest]
+        )
+        job = await job_manager.submit(
+            "editor_open",
+            payload,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            session_id=session.id,
+            cleanup_session_on_failure=True,
+            idempotency_scope="local",
+        )
+        return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
     except BaseException:
         if session is not None:
             session_manager.close(session.id)
-        raise
-    finally:
         temp_manager.discard(src_path)
-    return {
-        "docId": session.id,
-        "originalName": session.original_name,
-        "pageCount": len(meta),
-        "revision": session.revision,
-        "pages": meta,
-        "textModel": model,
-    }
+        raise
 
 
 @router.post("/{doc_id}/apply", summary="应用文本编辑（空文本=涂抹）")
-async def apply_edits(doc_id: str, payload: ApplyEditsRequest):
-    edits = payload.edits
+async def apply_edits(
+    doc_id: str,
+    payload: ApplyEditsRequest,
+    idempotency_key: str = Header(alias="Idempotency-Key"),
+):
     session = session_manager.get(doc_id)
-    with session.lock:
-        _check_revision(session, payload.expectedRevision)
-        doc = pdf_engine.open_pdf(session.path)
-        changed = False
-        try:
-            for edit in edits:
-                if edit.kind == "text":
-                    _check_line_anchor(session, doc, edit)
-                else:
-                    page = _check_page(session, edit.page, edit.pageId or "", doc)
-                page = doc[edit.page]
-                bbox = fitz.Rect(edit.bbox)
-                if not page.rect.contains(bbox):
-                    raise PdfError(422, "编辑区域超出页面范围", code="INVALID_BBOX")
-                new_text = edit.text
-                is_whiteout = edit.kind == "cover" or not new_text.strip()
-                if edit.kind == "text" and not is_whiteout and new_text == edit.original:
-                    continue
-                page.add_redact_annot(bbox, fill=(1, 1, 1))
-                page.apply_redactions(
-                    images=fitz.PDF_REDACT_IMAGE_NONE,
-                    graphics=fitz.PDF_REDACT_LINE_ART_NONE,
-                )
-                if is_whiteout:
-                    page.draw_rect(bbox, color=None, fill=(1, 1, 1))
-                    changed = True
-                    continue
-                font = pdf_engine.pick_font(new_text)
-                size = float(edit.fontSize or max(bbox.height * 0.8, 6))
-                inserted = False
-                while size >= 6:
-                    rc = page.insert_textbox(
-                        bbox,
-                        new_text,
-                        fontname=font,
-                        fontsize=size,
-                        align=fitz.TEXT_ALIGN_LEFT,
-                    )
-                    if rc >= 0:
-                        inserted = True
-                        break
-                    size *= 0.95
-                if not inserted:
-                    page.insert_text(
-                        (bbox.x0 + 1, bbox.y1 - 1),
-                        new_text,
-                        fontname=font,
-                        fontsize=6,
-                    )
-                changed = True
-            if changed:
-                doc = pdf_engine.commit_and_reload(doc, session.path, garbage=4, deflate=True)
-                session.revision += 1
-            model = extract_text_model(doc, session.page_ids)
-            meta = _page_meta(doc, session.page_ids)
-        finally:
-            doc.close()
-        return {
-            "ok": True,
-            "pageCount": len(meta),
-            "revision": session.revision,
-            "pages": meta,
-            "textModel": model,
-        }
+    _preflight_edits(session, payload)
+    payload_dict = payload.model_dump()
+    payload_dict.update({"source_path": str(session.path), "page_ids": list(session.page_ids)})
+    request_hash = job_manager.fingerprint(
+        "editor_apply", {**payload_dict, "docId": doc_id}, []
+    )
+    job = await job_manager.submit(
+        "editor_apply",
+        payload_dict,
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
+        session_id=doc_id,
+        expected_revision=payload.expectedRevision,
+    )
+    return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
 
 
 @router.post("/{doc_id}/text/add", summary="添加文字")
-async def add_text(doc_id: str, payload: AddTextRequest):
-    color = _parse_color(payload.color)
-    font = pdf_engine.pick_font(payload.text)
+async def add_text(
+    doc_id: str,
+    payload: AddTextRequest,
+    idempotency_key: str = Header(alias="Idempotency-Key"),
+):
     session = session_manager.get(doc_id)
-    with session.lock:
-        _check_revision(session, payload.expectedRevision)
-        doc = pdf_engine.open_pdf(session.path)
-        try:
-            page = _check_page(session, payload.page, payload.pageId, doc)
-            page.insert_text(
-                (payload.x, payload.y), payload.text, fontname=font,
-                fontsize=payload.fontSize, color=color
-            )
-            doc = pdf_engine.commit_and_reload(doc, session.path, garbage=4, deflate=True)
-            session.revision += 1
-            model = extract_text_model(doc, session.page_ids)
-            meta = _page_meta(doc, session.page_ids)
-        finally:
-            doc.close()
-        return {
-            "ok": True,
-            "pageCount": len(meta),
-            "revision": session.revision,
-            "pages": meta,
-            "textModel": model,
-        }
+    _preflight_page_write(
+        session, payload.expectedRevision, payload.page, payload.pageId,
+        fitz.Rect(payload.x, payload.y, payload.x + 1, payload.y + 1),
+    )
+    payload_dict = payload.model_dump()
+    payload_dict.update({"source_path": str(session.path), "page_ids": list(session.page_ids)})
+    request_hash = job_manager.fingerprint(
+        "editor_add_text", {**payload_dict, "docId": doc_id}, []
+    )
+    job = await job_manager.submit(
+        "editor_add_text",
+        payload_dict,
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
+        session_id=doc_id,
+        expected_revision=payload.expectedRevision,
+    )
+    return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
 
 
 @router.post("/{doc_id}/image/add", summary="添加图片/印章")
@@ -315,6 +317,7 @@ async def add_image(
     h: float = Form(...),
     expectedRevision: int = Form(..., ge=0),
     pageId: str = Form(...),
+    idempotency_key: str = Header(alias="Idempotency-Key"),
 ):
     if not all(math.isfinite(v) for v in (x, y, w, h)) or w <= 0 or h <= 0:
         raise PdfError(400, "图片尺寸必须为正数")
@@ -322,112 +325,122 @@ async def add_image(
     img_path = await save_upload(image, suffix=Path(image.filename or "stamp.png").suffix or ".png")
     try:
         validate_image(img_path)
-        with session.lock:
-            _check_revision(session, expectedRevision)
-            doc = pdf_engine.open_pdf(session.path)
-            try:
-                _check_page(session, page, pageId, doc)
-                rect = fitz.Rect(x, y, x + w, y + h)
-                if not doc[page].rect.contains(rect):
-                    raise PdfError(422, "图片区域超出页面范围", code="INVALID_BBOX")
-                try:
-                    doc[page].insert_image(rect, filename=str(img_path))
-                except Exception as exc:  # noqa: BLE001
-                    raise PdfError(422, "图片无法插入 PDF", code="INVALID_IMAGE") from exc
-                doc = pdf_engine.commit_and_reload(doc, session.path, garbage=4, deflate=True)
-                session.revision += 1
-                model = extract_text_model(doc, session.page_ids)
-                meta = _page_meta(doc, session.page_ids)
-            finally:
-                doc.close()
-    finally:
+        _preflight_page_write(
+            session, expectedRevision, page, pageId,
+            fitz.Rect(x, y, x + w, y + h),
+        )
+        payload = {
+            "source_path": str(session.path),
+            "image_path": str(img_path),
+            "page_ids": list(session.page_ids),
+            "page": page,
+            "pageId": pageId,
+            "x": x,
+            "y": y,
+            "w": w,
+            "h": h,
+        }
+        request_hash = job_manager.fingerprint(
+            "editor_add_image", {**payload, "docId": doc_id, "expectedRevision": expectedRevision},
+            [temp_manager.get_digest(img_path)],
+        )
+        job = await job_manager.submit(
+            "editor_add_image",
+            payload,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            input_paths=[img_path],
+            session_id=doc_id,
+            expected_revision=expectedRevision,
+        )
+        return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
+    except BaseException:
         temp_manager.discard(img_path)
-    return {
-        "ok": True,
-        "pageCount": len(meta),
-        "revision": session.revision,
-        "pages": meta,
-        "textModel": model,
-    }
+        raise
 
 
 @router.post("/{doc_id}/pages/rotate", summary="旋转页面")
-async def rotate_page(doc_id: str, payload: RotatePageRequest):
+async def rotate_page(
+    doc_id: str,
+    payload: RotatePageRequest,
+    idempotency_key: str = Header(alias="Idempotency-Key"),
+):
     page_no, angle = payload.page, payload.angle
     if angle not in (90, 180, 270):
         raise PdfError(400, "旋转角度仅支持 90/180/270")
     session = session_manager.get(doc_id)
-    with session.lock:
-        _check_revision(session, payload.expectedRevision)
-        doc = pdf_engine.open_pdf(session.path)
-        try:
-            if page_no < 0 or page_no >= doc.page_count:
-                raise PdfError(400, f"页码越界: {page_no}")
-            doc[page_no].set_rotation((doc[page_no].rotation + angle) % 360)
-            doc = pdf_engine.commit_and_reload(doc, session.path, garbage=4, deflate=True)
-            session.revision += 1
-            model = extract_text_model(doc, session.page_ids)
-            meta = _page_meta(doc, session.page_ids)
-        finally:
-            doc.close()
-        return {"ok": True, "pageCount": len(meta), "revision": session.revision, "pages": meta, "textModel": model}
+    payload_dict = {
+        "source_path": str(session.path),
+        "page_ids": list(session.page_ids),
+        "page": page_no,
+        "angle": angle,
+    }
+    request_hash = job_manager.fingerprint(
+        "editor_rotate", {**payload_dict, "docId": doc_id, "expectedRevision": payload.expectedRevision}, []
+    )
+    job = await job_manager.submit(
+        "editor_rotate", payload_dict, idempotency_key=idempotency_key,
+        request_hash=request_hash, session_id=doc_id,
+        expected_revision=payload.expectedRevision,
+    )
+    return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
 
 
 @router.post("/{doc_id}/pages/delete", summary="删除页面")
-async def delete_pages(doc_id: str, payload: DeletePagesRequest):
+async def delete_pages(
+    doc_id: str,
+    payload: DeletePagesRequest,
+    idempotency_key: str = Header(alias="Idempotency-Key"),
+):
     pages = payload.pages
     session = session_manager.get(doc_id)
-    with session.lock:
-        _check_revision(session, payload.expectedRevision)
-        doc = pdf_engine.open_pdf(session.path)
-        try:
-            indices = sorted(set(pages))
-            if any(i < 0 or i >= doc.page_count for i in indices):
-                raise PdfError(400, "页码越界")
-            if len(indices) >= doc.page_count:
-                raise PdfError(400, "不能删除全部页面")
-            doc.delete_pages(indices)
-            doc = pdf_engine.commit_and_reload(doc, session.path, garbage=4, deflate=True)
-            session.page_ids = [pid for i, pid in enumerate(session.page_ids) if i not in set(indices)]
-            session.revision += 1
-            model = extract_text_model(doc, session.page_ids)
-            meta = _page_meta(doc, session.page_ids)
-        finally:
-            doc.close()
-        return {"ok": True, "pageCount": len(meta), "revision": session.revision, "pages": meta, "textModel": model}
+    payload_dict = {
+        "source_path": str(session.path),
+        "page_ids": list(session.page_ids),
+        "pages": pages,
+    }
+    request_hash = job_manager.fingerprint(
+        "editor_delete", {**payload_dict, "docId": doc_id, "expectedRevision": payload.expectedRevision}, []
+    )
+    job = await job_manager.submit(
+        "editor_delete", payload_dict, idempotency_key=idempotency_key,
+        request_hash=request_hash, session_id=doc_id,
+        expected_revision=payload.expectedRevision,
+    )
+    return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
 
 
 @router.post("/{doc_id}/pages/move", summary="移动页面")
-async def move_page(doc_id: str, payload: MovePageRequest):
+async def move_page(
+    doc_id: str,
+    payload: MovePageRequest,
+    idempotency_key: str = Header(alias="Idempotency-Key"),
+):
     src, dst = payload.fromPage, payload.toPage
     session = session_manager.get(doc_id)
-    with session.lock:
-        _check_revision(session, payload.expectedRevision)
-        doc = pdf_engine.open_pdf(session.path)
-        try:
-            total = doc.page_count
-            if not (0 <= src < total) or not (0 <= dst < total):
-                raise PdfError(400, "页码越界")
-            order = list(range(total))
-            order.pop(src)
-            order.insert(dst, src)
-            doc.select(order)
-            doc = pdf_engine.commit_and_reload(doc, session.path, garbage=4, deflate=True)
-            ids = list(session.page_ids)
-            moved_id = ids.pop(src)
-            ids.insert(dst, moved_id)
-            session.page_ids = ids
-            session.revision += 1
-            model = extract_text_model(doc, session.page_ids)
-            meta = _page_meta(doc, session.page_ids)
-        finally:
-            doc.close()
-        return {"ok": True, "pageCount": len(meta), "revision": session.revision, "pages": meta, "textModel": model}
+    payload_dict = {
+        "source_path": str(session.path),
+        "page_ids": list(session.page_ids),
+        "from": src,
+        "to": dst,
+    }
+    request_hash = job_manager.fingerprint(
+        "editor_move", {**payload_dict, "docId": doc_id, "expectedRevision": payload.expectedRevision}, []
+    )
+    job = await job_manager.submit(
+        "editor_move", payload_dict, idempotency_key=idempotency_key,
+        request_hash=request_hash, session_id=doc_id,
+        expected_revision=payload.expectedRevision,
+    )
+    return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
 
 
 @router.get("/{doc_id}/download", summary="另存为下载")
 async def download(doc_id: str, filename: str = Query(default="")):
     session = session_manager.get(doc_id)
+    with session.lock:
+        if session.pending_job_id is not None:
+            raise PdfError(409, "文档修改任务仍在执行，请等待任务完成", code="SESSION_BUSY")
     name = filename.strip() or session.original_name
     if not name.lower().endswith(".pdf"):
         name += ".pdf"
@@ -438,7 +451,12 @@ async def download(doc_id: str, filename: str = Query(default="")):
 
 @router.post("/{doc_id}/close", summary="关闭编辑会话")
 async def close_session(doc_id: str):
-    session_manager.close(doc_id)
+    session = session_manager._sessions.get(doc_id)
+    if session is not None:
+        with session.lock:
+            if session.pending_job_id is not None:
+                raise PdfError(409, "文档修改任务仍在执行，请先等待或取消任务", code="SESSION_BUSY")
+            session_manager.close(doc_id)
     return {"ok": True}
 
 
