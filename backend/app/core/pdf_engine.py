@@ -32,6 +32,9 @@ def open_pdf(path: Path) -> fitz.Document:
         doc = fitz.open(str(path))
     except Exception as exc:  # noqa: BLE001 - fitz raises broad types
         raise PdfError(400, "上传内容不是可读取的 PDF", code="INVALID_PDF") from exc
+    if not doc.is_pdf:
+        doc.close()
+        raise PdfError(400, "上传内容不是可读取的 PDF", code="INVALID_PDF")
     if doc.is_encrypted:
         if not doc.authenticate(""):
             doc.close()

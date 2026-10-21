@@ -18,6 +18,8 @@ def validate_pdf(path: Path, *, allow_encrypted: bool = False) -> int | None:
     except Exception as exc:  # noqa: BLE001 - PyMuPDF raises several parser errors
         raise PdfError(400, "上传内容不是可读取的 PDF", code="INVALID_PDF") from exc
     try:
+        if not document.is_pdf:
+            raise PdfError(400, "上传内容不是可读取的 PDF", code="INVALID_PDF")
         if document.is_encrypted and not document.authenticate(""):
             if allow_encrypted:
                 return None
