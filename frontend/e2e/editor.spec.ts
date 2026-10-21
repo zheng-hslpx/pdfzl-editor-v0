@@ -232,8 +232,8 @@ test("recovers an opted-in IndexedDB text draft after a browser reload", async (
   await page.reload();
   await page.getByRole("button", { name: "恢复", exact: true }).waitFor({ state: "visible", timeout: 30_000 });
   await page.getByRole("button", { name: "恢复", exact: true }).click();
-  await expect(page.locator("textarea").first()).toHaveValue("DRAFT RESTORED AFTER RELOAD", { timeout: 30_000 });
   await expect(page.getByText(/撤销历史从空状态开始/)).toBeVisible();
+  await expect(page.locator("textarea").first()).toHaveValue("DRAFT RESTORED AFTER RELOAD", { timeout: 30_000 });
 });
 
 test("shows task progress, prevents a duplicate submit, and requests cancellation", async ({ page }) => {
