@@ -40,10 +40,13 @@ if (
     raise ValueError("PDF_EDITOR_UI_ORIGIN must be an http origin on 127.0.0.1")
 CORS_ORIGINS: list[str] = [UI_ORIGIN]
 LO_READY_TIMEOUT_SECONDS: float = float(
-    os.environ.get("PDF_EDITOR_LO_READY_TIMEOUT_SECONDS", "10")
+    os.environ.get("PDF_EDITOR_LO_READY_TIMEOUT_SECONDS", "20")
 )
 LO_READY_CACHE_SECONDS: float = float(
     os.environ.get("PDF_EDITOR_LO_READY_CACHE_SECONDS", "300")
+)
+LO_READY_RETRY_SECONDS: float = float(
+    os.environ.get("PDF_EDITOR_LO_READY_RETRY_SECONDS", "5")
 )
 
 JOB_TIMEOUT_SECONDS: float = float(os.environ.get("PDF_EDITOR_JOB_TIMEOUT_SECONDS", "900"))

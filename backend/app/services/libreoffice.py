@@ -58,8 +58,8 @@ def _profile_url(profile: Path) -> str:
     return f"file:///{quote(profile.as_posix(), safe=':/')}"
 
 
-async def _probe_functional() -> bool:
-    """Perform one real conversion using a private profile and hard timeout."""
+async def _probe_functional() -> bool | None:
+    """Perform one real conversion; None means the bounded probe timed out."""
     if not soffice_available():
         return False
     config.ensure_dirs()
@@ -94,7 +94,9 @@ async def _probe_functional() -> bool:
             if proc.returncode is None:
                 proc.kill()
                 await proc.wait()
-            return False
+            # A timeout only says this probe did not finish in its budget. It
+            # does not prove LibreOffice is unusable; let readiness retry.
+            return None
         except Exception:
             process_tree.close()
             if proc.returncode is None:
@@ -124,7 +126,8 @@ async def _refresh_readiness() -> None:
     try:
         _probe_cache = await _probe_functional()
     except Exception:
-        _probe_cache = False
+        logger.exception("LibreOffice readiness probe failed unexpectedly")
+        _probe_cache = None
     finally:
         _probe_checked_at = time.monotonic()
         _probe_checked_wall = time.time()
@@ -138,11 +141,14 @@ async def readiness_snapshot() -> dict:
         _probe_cache = False
         _probe_checked_at = time.monotonic()
         _probe_checked_wall = time.time()
-    elif (
-        _probe_task is None
-        and (_probe_cache is None or time.monotonic() - _probe_checked_at >= config.LO_READY_CACHE_SECONDS)
-    ):
-        _probe_task = asyncio.create_task(_refresh_readiness(), name="libreoffice-readiness")
+    elif _probe_task is None:
+        retry_after = (
+            config.LO_READY_RETRY_SECONDS
+            if _probe_cache is None
+            else config.LO_READY_CACHE_SECONDS
+        )
+        if time.monotonic() - _probe_checked_at >= retry_after:
+            _probe_task = asyncio.create_task(_refresh_readiness(), name="libreoffice-readiness")
     status = "unknown" if _probe_cache is None else ("ready" if _probe_cache else "not_ready")
     return {
         "status": status,
@@ -163,7 +169,7 @@ def soffice_functional() -> bool:
         _probe_cache = asyncio.run(_probe_functional())
         _probe_checked_at = time.monotonic()
         _probe_checked_wall = time.time()
-        return _probe_cache
+        return _probe_cache is True
     # A running event loop must never be blocked by a health or request path.
     return bool(_probe_cache)
 

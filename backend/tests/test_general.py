@@ -5,6 +5,7 @@ import asyncio
 import io
 import time
 import zipfile
+from unittest.mock import AsyncMock
 
 import fitz
 import pytest
@@ -89,6 +90,96 @@ def test_readiness_returns_cached_state_without_waiting_for_probe(client, monkey
     assert ready.json()["status"] == "ready"
     assert ready.json()["checking"] is False
     assert calls == 1
+
+
+def test_readiness_probe_timeout_is_inconclusive_and_retried(client, monkeypatch):
+    calls = 0
+
+    async def probe_sequence():
+        nonlocal calls
+        calls += 1
+        return None if calls == 1 else True
+
+    monkeypatch.setattr(libreoffice, "soffice_available", lambda: True)
+    monkeypatch.setattr(libreoffice, "_probe_cache", None)
+    monkeypatch.setattr(libreoffice, "_probe_checked_at", 0.0)
+    monkeypatch.setattr(libreoffice, "_probe_checked_wall", None)
+    monkeypatch.setattr(libreoffice, "_probe_task", None)
+    monkeypatch.setattr(libreoffice, "_probe_functional", probe_sequence)
+    monkeypatch.setattr(libreoffice.config, "LO_READY_RETRY_SECONDS", 3600.0)
+
+    first = client.get("/api/health/ready")
+    assert first.json()["status"] == "unknown"
+    assert first.json()["checking"] is True
+
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        state = client.get("/api/health/ready").json()
+        if not state["checking"]:
+            break
+        time.sleep(0.01)
+    assert state["status"] == "unknown"
+    assert state["checking"] is False
+    assert calls == 1
+
+    monkeypatch.setattr(
+        libreoffice, "_probe_checked_at", time.monotonic() - 3601.0
+    )
+    retry = client.get("/api/health/ready")
+    assert retry.json()["status"] == "unknown"
+    assert retry.json()["checking"] is True
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        state = client.get("/api/health/ready").json()
+        if not state["checking"]:
+            break
+        time.sleep(0.01)
+    assert state["status"] == "ready"
+    assert state["checking"] is False
+    assert calls == 2
+
+
+def test_libreoffice_probe_timeout_returns_unknown(monkeypatch, tmp_path):
+    class HangingProcess:
+        pid = 12345
+        returncode = None
+        killed = False
+
+        async def communicate(self):
+            await asyncio.sleep(0.1)
+
+        def kill(self):
+            self.killed = True
+
+        async def wait(self):
+            self.returncode = -9
+
+    class ProcessTree:
+        def __init__(self, _memory_limit):
+            pass
+
+        def attach(self, _pid):
+            pass
+
+        def close(self):
+            pass
+
+    proc = HangingProcess()
+    monkeypatch.setattr(libreoffice, "soffice_available", lambda: True)
+    monkeypatch.setattr(libreoffice.config, "TEMP_DIR", tmp_path)
+    monkeypatch.setattr(libreoffice.config, "LO_READY_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(libreoffice, "WindowsJobObject", ProcessTree)
+    monkeypatch.setattr(
+        libreoffice.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=proc),
+    )
+
+    result = asyncio.run(libreoffice._probe_functional())
+
+    assert result is None
+    assert proc.killed is True
+    assert list(tmp_path.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
