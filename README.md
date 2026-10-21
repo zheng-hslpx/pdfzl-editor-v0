@@ -2,7 +2,7 @@
 
 本机运行的单用户 PDF 工具。文档在本机处理；后端与 Vite 默认只监听 `127.0.0.1`。服务没有登录鉴权；请勿绑定到局域网或公网地址。项目按本机处理设计，但尚未完成全量运行时网络外呼审计。
 
-截至 2026-10-21，F01–F13 和四项最终验收补充整改已完成，本机规定的 pytest、Vitest、TypeScript、production build 及开发/production E2E 均通过。**建议 PDF Editor v0.2 通过个人离线自用正式验收**；本地未打 tag 或发布。LibreOffice 强制终止后的外部临时目录清理、极端 PDF 与资源压力尚未穷尽验证。PyMuPDF 许可路线是未来公开分发前的所有者决策，不是个人离线自用验收阻断项。产品范围不含 OCR、表单、批注或真正的安全 redaction。当前工具注册表有 **11 个入口**；“格式转换”入口内含 5 种转换。
+截至 2026-10-21，F01–F13 和四项最终验收补充整改已完成，本机规定的 pytest、Vitest、TypeScript、production build 及开发/production E2E 均通过。**建议 PDF Editor v0.2 通过个人离线自用正式验收**；尚未公开发布。LibreOffice 强制终止后的外部临时目录清理、极端 PDF 与资源压力尚未穷尽验证。PyMuPDF 许可路线是未来公开分发前的所有者决策，不是个人离线自用验收阻断项。产品范围不含 OCR、表单、批注或真正的安全 redaction。当前工具注册表有 **11 个入口**；“格式转换”入口内含 5 种转换。
 
 ## 功能
 
@@ -91,6 +91,7 @@ Playwright 配置会启动本地后端和 Vite。可通过 `PYTHON` 指定启动
 - Playwright Chromium 开发模式 **16/16**、Production preview 模式 **16/16**。包含 F01 双 save-race、草稿恢复、新增长文字溢出真实浏览器流程、transient 503 后预览重试及 StrictMode 文件切换/卸载；preview 全套访问 `4173` 的 production preview。
 - PDF.js 静态资源检查通过：锁定及安装版本均为 `6.4.299`；169 个 CMap 目录文件和 16 个 standard-font 目录文件（均包含相应许可文件）逐文件 SHA-256 一致。篡改资源的临时故障夹具被脚本拒绝。
 - 预览打开有可取消的 60 秒截止；Vitest 故障注入验证打开超时、render rejection、重试、卸载和 `loadingTask.destroy()` 后释放 Blob URL。真实浏览器 transient 503 后重试读取并渲染真实 PDF 成功。
+- Windows 一键启动器修复 CRLF 行尾后实跑通过，显示 `Ready!`；后端和 Vite 代理 health 均返回 `200`。Git checkout 由 `.gitattributes` 固定批处理文件为 CRLF。
 - Vite build 仍有 `EditorPage.tsx` 动态/静态导入提示和大于 500 kB 的 chunk 提示；不影响 build 成功。
 - 本次未运行 `pip-audit`、`npm audit`、CycloneDX 或托管 CI，也未 push；这些结果不能记作本次通过。
 
