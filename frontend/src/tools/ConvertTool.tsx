@@ -31,7 +31,7 @@ export default function ConvertTool() {
       minFiles={1}
       maxFiles={meta.multi ? -1 : 1}
       accepts={meta.accepts}
-      resultKind={direction === "pdf-to-text" ? "text" : direction === "pdf-to-image" ? "image" : "pdf"}
+      resultKind="auto"
       notices={
         direction === "pdf-to-word"
           ? ["PDF 转 Word 为尽力而为的版式重建：复杂排版、扫描件可能丢失格式，请转换后校对。"]

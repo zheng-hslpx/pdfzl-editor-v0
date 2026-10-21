@@ -33,9 +33,8 @@ import {
   type JobProgress,
 } from "../api/client";
 import { setPendingEditorFile } from "../lib/pendingFile";
+import { resolveOutputKind, resultKindLabel, type ResultKind } from "../lib/resultFormat";
 import { PdfViewer } from "./PdfViewer";
-
-export type ResultKind = "pdf" | "zip" | "image" | "text" | "json" | "docx";
 
 export interface ToolFlowProps {
   /** Minimum number of files required to execute. */
@@ -49,7 +48,7 @@ export interface ToolFlowProps {
   notices?: string[];
   /** Runs the tool; receives files in current order. */
   execute?: (files: ManagedFile[], options: JobOptions) => Promise<FileResult>;
-  resultKind: ResultKind;
+  resultKind: ResultKind | "auto";
   /** JSON variant: renders a custom panel instead of a file result. */
   executeJson?: (files: ManagedFile[], options: JobOptions) => Promise<unknown>;
   renderJson?: (data: unknown) => ReactNode;
@@ -77,6 +76,7 @@ export function ToolFlow({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<FileResult | null>(null);
+  const [displayResultKind, setDisplayResultKind] = useState<ResultKind | null>(null);
   const [jsonData, setJsonData] = useState<unknown>(null);
   const [resultPreview, setResultPreview] = useState<ReactNode>(null);
   const [jobProgress, setJobProgress] = useState<JobProgress | null>(null);
@@ -107,8 +107,14 @@ export function ToolFlow({
           signal: controller.signal,
           onProgress: setJobProgress,
         });
+        const kind = resolveOutputKind(
+          res.filename,
+          res.blob.type,
+          resultKind === "auto" ? "other" : resultKind,
+        );
         setResult(res);
-        setResultPreview(renderPreview(res, resultKind));
+        setDisplayResultKind(kind);
+        setResultPreview(renderPreview(res, kind));
       }
       setActive(3);
     } catch (err) {
@@ -123,6 +129,7 @@ export function ToolFlow({
 
   const reset = () => {
     setResult(null);
+    setDisplayResultKind(null);
     setJsonData(null);
     setResultPreview(null);
     setError(null);
@@ -319,7 +326,7 @@ export function ToolFlow({
                   下载文件
                 </Button>
               )}
-              {result && resultKind === "pdf" && (
+              {result && displayResultKind === "pdf" && (
                 <Button
                   variant="light"
                   leftSection={<IconPencil size={16} />}
@@ -357,9 +364,15 @@ function renderPreview(result: FileResult, kind: ResultKind): ReactNode {
       return <TextPreview blob={result.blob} />;
     default:
       return (
-        <Text size="sm" c="dimmed">
-          该格式暂不支持内嵌预览，请下载后查看。
-        </Text>
+        <Paper withBorder p="md" radius="md">
+          <Stack gap={4}>
+            <Title order={5}>文件信息</Title>
+            <Text size="sm">文件名：{result.filename}</Text>
+            <Text size="sm">输出格式：{resultKindLabel(kind)}</Text>
+            <Text size="xs" c="dimmed">MIME：{result.blob.type || "未提供"}</Text>
+            <Text size="sm" c="dimmed">该格式暂不支持内嵌预览，请使用上方下载文件入口查看。</Text>
+          </Stack>
+        </Paper>
       );
   }
 }

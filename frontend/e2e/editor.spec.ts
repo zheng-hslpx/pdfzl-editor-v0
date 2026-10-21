@@ -7,11 +7,13 @@ import { expect, test, type Page } from "@playwright/test";
 let fixtureDirectory = "";
 let fixturePath = "";
 let raceFixturePath = "";
+let imageFixturePath = "";
 
 test.beforeAll(() => {
   fixtureDirectory = mkdtempSync(join(tmpdir(), "pdfed-e2e-"));
   fixturePath = join(fixtureDirectory, "editor-smoke.pdf");
   raceFixturePath = join(fixtureDirectory, "editor-race.pdf");
+  imageFixturePath = join(fixtureDirectory, "conversion-image.png");
   const python = process.env.PYTHON ?? (process.platform === "win32" ? "python" : "python3");
   const source = [
     "import fitz, sys",
@@ -31,8 +33,10 @@ test.beforeAll(() => {
     "race_page.insert_text((40, 110), 'PAGE1 SECOND ORIGINAL', fontsize=14)",
     "race.save(sys.argv[2])",
     "race.close()",
+    "from PIL import Image",
+    "Image.new('RGB', (120, 80), (30, 90, 150)).save(sys.argv[3])",
   ].join("; ");
-  execFileSync(python, ["-c", source, fixturePath, raceFixturePath], { stdio: "pipe" });
+  execFileSync(python, ["-c", source, fixturePath, raceFixturePath, imageFixturePath], { stdio: "pipe" });
 });
 
 test.afterAll(() => {
@@ -300,6 +304,48 @@ test("renders PDF tool results under StrictMode across file changes and unmount"
   await page.getByRole("link", { name: "全部工具", exact: true }).click();
   await expect(page.getByRole("heading", { name: "PDF 工具箱" })).toBeVisible();
   expect(pdfErrors).toEqual([]);
+});
+
+test("uses actual conversion output types for PDF, DOCX, ZIP, image, and text results", async ({ page }) => {
+  test.setTimeout(180_000);
+  page.setDefaultTimeout(10_000);
+
+  const convert = async (direction: string, inputPath: string, pages?: string) => {
+    await page.goto("/tool/convert");
+    await page.locator('input[type="file"]').setInputFiles(inputPath);
+    await page.getByRole("button", { name: "下一步：设置" }).click();
+    await page.getByRole("textbox", { name: "转换方向" }).click();
+    await page.getByRole("option", { name: direction }).click();
+    if (pages) await page.getByRole("textbox", { name: "页码范围" }).fill(pages);
+    await page.getByRole("button", { name: "下一步：执行" }).click();
+    await page.getByRole("button", { name: "开始处理", exact: true }).click();
+    await expect(page.getByText("处理完成", { exact: true })).toBeVisible({ timeout: 60_000 });
+  };
+
+  await convert("PDF → Word（DOCX，格式可能丢失）", fixturePath);
+  await expect(page.getByText("输出格式：Word 文档", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "下载文件" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "在编辑器中打开" })).toHaveCount(0);
+  await expect(page.locator("canvas, img")).toHaveCount(0);
+
+  await convert("PDF → 图片（PNG/JPEG）", fixturePath);
+  await expect(page.getByText("输出格式：ZIP 压缩包", { exact: true })).toBeVisible();
+  await expect(page.getByText("editor-smoke_images.zip", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "在编辑器中打开" })).toHaveCount(0);
+  await expect(page.locator("canvas, img")).toHaveCount(0);
+
+  await convert("PDF → 图片（PNG/JPEG）", fixturePath, "1");
+  await expect(page.getByRole("img", { name: "result" })).toBeVisible();
+  await expect.poll(() => page.locator("img").first().evaluate((image) => (image as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+  await expect(page.getByRole("button", { name: "在编辑器中打开" })).toHaveCount(0);
+
+  await convert("PDF → 文本（TXT）", fixturePath);
+  await expect(page.getByText(/PAGE-1 EDITABLE/)).toBeVisible();
+  await expect(page.locator("canvas, img")).toHaveCount(0);
+
+  await convert("图片 → PDF", imageFixturePath);
+  await expect(page.getByRole("button", { name: "在编辑器中打开" })).toBeVisible();
+  await expect(page.locator("canvas").first()).toBeVisible();
 });
 
 test("launcher default origin loads the editor and accepts a PDF upload", async ({ page }) => {
