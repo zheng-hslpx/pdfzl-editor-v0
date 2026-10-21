@@ -2,7 +2,7 @@
 
 本机运行的单用户 PDF 工具。文档在本机处理；后端与 Vite 默认只监听 `127.0.0.1`。服务没有登录鉴权；请勿绑定到局域网或公网地址。项目按本机处理设计，但尚未完成全量运行时网络外呼审计。
 
-v0.2 已完成审查缺陷 F01–F13 的修复和本机回归。**正式产品/发布验收仍待决策**：LibreOffice readiness 冷启动误判、部分异常提示准确性和强制终止后的外部临时目录清理仍有边界未验证；公开分发前还需项目所有者决定 PyMuPDF 许可路径。产品范围不含 OCR、表单、批注或真正的安全 redaction。当前工具注册表有 **11 个入口**；“格式转换”入口内含 5 种转换。
+v0.2 的 F01–F13 整改和本机回归已通过，当前进入正式验收判断。**这不代表正式验收或发布已完成**：LibreOffice 强制终止后的外部临时目录清理仍有边界未验证；公开分发前还需项目所有者决定 PyMuPDF 许可路径。产品范围不含 OCR、表单、批注或真正的安全 redaction。当前工具注册表有 **11 个入口**；“格式转换”入口内含 5 种转换。
 
 ## 功能
 
@@ -26,7 +26,7 @@ v0.2 已完成审查缺陷 F01–F13 的修复和本机回归。**正式产品/�
 - 一个重任务运行、最多一个排队；队列满时返回 `429 JOB_QUEUE_FULL`。长任务返回 `202` 和 `jobId`，用 `GET /api/v1/jobs/{jobId}` 查询进度，用 `POST /api/v1/jobs/{jobId}/cancel` 请求取消。长任务使用 `Idempotency-Key` 防止重复提交。
 - PyMuPDF 重任务、单页文本提取、锚点预检和 PDF 内容校验在独立子进程执行，共用 worker 内存预算 2 GiB、任务墙钟预算 15 分钟和有界队列。超限会终止 worker 并清理任务产物；原会话文件保持不变。LibreOffice 子目录在强制终止后的所有清理边界尚未完整验证，见“已知限制”。
 - **24 MP** 是单页预览预算；超出时降低预览分辨率并提示。**160 MP** 是每个渲染批次的在途像素预算，不是整个导出的累计上限；处理后会释放每批像素缓冲。
-- `/api/health` 是不依赖 LibreOffice 的轻量存活检查。`/api/health/ready` 返回缓存的 LibreOffice readiness；冷启动探测默认最多等待 10 秒，若探测较慢可能暂时报 `not_ready`，而后续 Office 转换仍可能成功。探测有缓存刷新间隔，不由 health 请求同步等待。
+- `/api/health` 是不依赖 LibreOffice 的轻量存活检查。`/api/health/ready` 返回缓存的 LibreOffice readiness；冷启动探测默认最多等待 20 秒，health 请求不会同步等待。探测超时时状态保持 `unknown`，5 秒后可重试；只有探测明确失败才报告 `not_ready`。本机真实冷启动 readiness 探测耗时约 13 秒。
 - 编辑会话在内存中，服务重启后不会恢复；活动编辑器定期 heartbeat，2 小时无活动后过期。关闭文件会立即清理会话。
 
 ## 快速开始
@@ -76,29 +76,30 @@ npx playwright install chromium
 npm run test:e2e
 ```
 
-Playwright 配置会启动本地后端和 Vite。开发机默认使用已安装的 Chrome；CI 使用 Playwright Chromium。GitHub Actions 分别定义 Linux 后端、Windows + LibreOffice 后端、TypeScript/Vitest/Vite build、Chromium E2E、SBOM 与依赖审计任务，并归档测试结果和审计报告。每次 pytest 通过数、跳过数及跳过原因以 CI 报告为准，不把跳过记作通过。
+Playwright 配置会启动本地后端和 Vite。可通过 `PYTHON` 指定启动后端的 Python 解释器，该解释器需安装后端锁定依赖（包括 `uvicorn`）。开发机默认使用已安装的 Chrome；CI 使用 Playwright Chromium。GitHub Actions 分别定义 Linux 后端、Windows + LibreOffice 后端、TypeScript/Vitest/Vite build、Chromium E2E、SBOM 与依赖审计任务，并归档测试结果和审计报告。每次 pytest 通过数、跳过数及跳过原因以 CI 报告为准，不把跳过记作通过。
 
 前端要求 Node.js 22.22.2 或更新的兼容版本。安装命令与 CI 一致使用 `--legacy-peer-deps`，以避开 npm 10 对 Vitest 4 可选 peer 依赖树的解析崩溃；测试所需的 `@testing-library/dom` 已列为直接开发依赖。
 
 ### 本机 v0.2 整改回归记录（2026-10-21）
 
-- 后端锁定环境：pytest **109 passed，0 skipped**；包含 F10–F13 回归和本机 LibreOffice Office→PDF 成功路径。收到一条既有 Starlette/httpx 弃用提示。
-- 前端：TypeScript 检查通过，Vitest **40/40**，Vite production build 成功。
-- Playwright Chromium 开发模式 **14/14**。Production preview 模式下，结果预览、实际转换类型、旋转页画布、中文 CMap 四项相关 E2E **4/4**；完整 14 项套件 **10 passed、4 failed**，失败项硬编码访问 `127.0.0.1:5173`，而 preview 配置监听 `4173`，因此这些用例没有覆盖到应用页面。
+- 后端锁定环境：pytest **111 passed，0 skipped**；包含 F10–F13 回归和本机 LibreOffice Office→PDF 成功路径。收到一条既有 Starlette/httpx 弃用提示。
+- 前端：TypeScript 检查通过，Vitest **47/47**，Vite production build 成功。
+- Playwright Chromium 开发模式 **14/14**、Production preview 模式 **14/14**；E2E 导航断言使用当前配置 origin，因此 preview 全套均访问 `4173` 上的实际应用。
+- LibreOffice readiness 使用独立临时 profile 实测冷启动转换 **13.08 秒**；新后端实例通过真实 `/api/health/ready` 请求从 `unknown/checking` 到 `ready`，耗时 **13.15 秒**。超时回归验证会保留 `unknown` 并冷却重试，不误报 `not_ready`。
+- Axios 提示回归覆盖结构化业务错误（JSON/Blob）、无响应网络故障、取消、已知服务端操作错误和 `INTERNAL_ERROR`，并区分提示。
 - Vite build 仍有 `EditorPage.tsx` 动态/静态导入提示和大于 500 kB 的 chunk 提示；不影响 build 成功。
-- 本次未重跑 `pip-audit`、`npm audit`、CycloneDX 或托管 CI。GitHub Actions 尚未因本地任务不执行 push 而触发；这些结果不能记作本次通过。
+- 本次未重跑 `pip-audit`、`npm audit`、CycloneDX 或托管 CI。GitHub Actions 尚未触发；这些结果不能记作本次通过。
 
 ## 已知限制
 
 1. PDF→Word 是尽力而为的版式重建，复杂排版和扫描件需校对；本项目没有 OCR。
-2. Office→PDF 依赖本机 LibreOffice。readiness 冷启动探测默认 10 秒；本机曾观察到探测先返回 `not_ready`，但实际 Office 转换可在更长时间内成功。转换操作另有 180 秒超时；不要把一次 `not_ready` 等同于 LibreOffice 未安装。
+2. Office→PDF 依赖本机 LibreOffice。readiness 探测有 20 秒预算；超时表示探测未能在预算内完成，会返回 `unknown` 并在短暂冷却后重试。实际冷启动路径已通过本机验证。转换操作另有 180 秒超时。
 3. 密码保护的 PDF 暂不支持处理；文档信息工具会将加密状态显示为“是 / 否 / 无法确认”。
 4. PDF 对象优化不做图像降采样，文件变小的幅度取决于具体文档。
 5. 浏览器本地恢复缓存未加密；不要对敏感文件开启。超过 7 天的记录在下次列出草稿时删除，不提供浏览器关闭期间的定时物理擦除保证。
 6. LibreOffice 进程树有 Windows Job Object 管理；强制终止发生在外部转换的不同阶段时，所有 profile/临时目录清理路径尚未逐一验证。
-7. 某些 Axios 请求错误在界面中可能显示通用 HTTP 错误文本，而不是后端返回的具体业务消息；API 仍返回结构化错误码和消息。
-8. 本次未对运行时所有网络外呼做全流量审计，也未运行托管 GitHub Actions；本机检查不能替代这些证据。
-9. 安装依赖时需要访问 Python/npm 软件源；安装完成后，PDF 处理不依赖云服务。
+7. 本次未对运行时所有网络外呼做全流量审计，也未运行托管 GitHub Actions；本机检查不能替代这些证据。
+8. 安装依赖时需要访问 Python/npm 软件源；安装完成后，PDF 处理不依赖云服务。
 
 ## 许可证
 
