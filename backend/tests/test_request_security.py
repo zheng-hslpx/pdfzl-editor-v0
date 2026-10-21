@@ -241,6 +241,12 @@ def test_local_host_and_origin_are_enforced(client):
     assert allowed.status_code == 200
     assert allowed.headers.get("access-control-allow-origin") == "http://127.0.0.1:5173"
 
+    launcher_origin = client.get(
+        "/api/health", headers={"Origin": "http://localhost:5173"}
+    )
+    assert launcher_origin.status_code == 403
+    assert launcher_origin.json()["code"] == "ORIGIN_NOT_ALLOWED"
+
     bad_origin = client.get(
         "/api/health", headers={"Origin": "http://example.invalid"}
     )

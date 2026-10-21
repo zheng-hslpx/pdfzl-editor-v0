@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { expect, test, type Page } from "@playwright/test";
@@ -251,6 +251,21 @@ test("shows task progress, prevents a duplicate submit, and requests cancellatio
   await page.getByRole("button", { name: "取消任务" }).click();
   await expect(page.getByText("任务已取消", { exact: true })).toBeVisible();
   expect(cancelRequested).toBe(true);
+});
+
+test("launcher default origin loads the editor and accepts a PDF upload", async ({ page }) => {
+  const launcher = readFileSync(join(import.meta.dirname, "../../start-editor.bat"), "utf8");
+  expect(launcher).toContain('set "UI_URL=http://127.0.0.1:5173"');
+  expect(launcher).toContain('curl.exe --fail --silent --show-error --max-time 2 "%HEALTH_URL%"');
+  expect(launcher).not.toContain("http://localhost:5173");
+
+  await page.goto("http://127.0.0.1:5173/editor");
+  const docId = await openSample(page);
+  await expect(page).toHaveURL("http://127.0.0.1:5173/editor");
+  const pagesResponse = await page.request.get(`http://127.0.0.1:8000/api/v1/edit/${docId}/pages`);
+  expect(pagesResponse.status()).toBe(200);
+  expect((await pagesResponse.json()).pageCount).toBe(3);
+  await expect(page.getByText("editor-smoke.pdf", { exact: true })).toBeVisible();
 });
 
 test("protects the session and dirty draft during browser back when recovery cache is off", async ({ page }) => {
