@@ -73,6 +73,10 @@ async function openSample(page: Page): Promise<string> {
   return match[1]!;
 }
 
+function appUrl(page: Page, pathname: string): string {
+  return new URL(pathname, new URL(page.url()).origin).href;
+}
+
 async function openTwoLineSample(page: Page): Promise<string> {
   await page.goto("/editor");
   const pdfRequest = page.waitForRequest(
@@ -526,15 +530,15 @@ test("renders the review Chinese PDF with local CMaps and fonts", async ({ page 
   await canvas.screenshot({ path: "test-results/f09-cjk-canvas.png" });
 });
 
-test("launcher default origin loads the editor and accepts a PDF upload", async ({ page }) => {
+test("launcher origin is configured and the active E2E origin accepts a PDF upload", async ({ page }) => {
   const launcher = readFileSync(join(import.meta.dirname, "../../start-editor.bat"), "utf8");
   expect(launcher).toContain('set "UI_URL=http://127.0.0.1:5173"');
   expect(launcher).toContain('curl.exe --fail --silent --show-error --max-time 2 "%HEALTH_URL%"');
   expect(launcher).not.toContain("http://localhost:5173");
 
-  await page.goto("http://127.0.0.1:5173/editor");
+  await page.goto("/editor");
   const docId = await openSample(page);
-  await expect(page).toHaveURL("http://127.0.0.1:5173/editor");
+  await expect(page).toHaveURL(appUrl(page, "/editor"));
   const pagesResponse = await page.request.get(`http://127.0.0.1:8000/api/v1/edit/${docId}/pages`);
   expect(pagesResponse.status()).toBe(200);
   expect((await pagesResponse.json()).pageCount).toBe(3);
@@ -560,7 +564,7 @@ test("protects the session and dirty draft during browser back when recovery cac
   );
   await page.evaluate(() => window.history.back());
   await page.getByRole("button", { name: "放弃草稿并继续" }).click();
-  await expect(page).toHaveURL("http://127.0.0.1:5173/");
+  await expect(page).toHaveURL(appUrl(page, "/"));
   expect((await closeResponse).status()).toBe(200);
 });
 
@@ -568,7 +572,7 @@ test("protects dirty drafts during browser forward navigation", async ({ page })
   await page.goto("/");
   await page.getByRole("link", { name: "可视化编辑器", exact: true }).click();
   await page.getByRole("link", { name: "全部工具", exact: true }).click();
-  await expect(page).toHaveURL("http://127.0.0.1:5173/");
+  await expect(page).toHaveURL(appUrl(page, "/"));
   await page.evaluate(() => window.history.back());
   await expect(page).toHaveURL(/\/editor$/);
   await openSample(page);
@@ -582,7 +586,7 @@ test("protects dirty drafts during browser forward navigation", async ({ page })
 
   await page.evaluate(() => window.history.forward());
   await page.getByRole("button", { name: "放弃草稿并继续" }).click();
-  await expect(page).toHaveURL("http://127.0.0.1:5173/");
+  await expect(page).toHaveURL(appUrl(page, "/"));
 });
 
 test("keeps the editor session open when navigation is attempted during a save", async ({ page }) => {
@@ -624,7 +628,7 @@ test("saves and exports the edited PDF before completing browser back navigation
   await page.evaluate(() => window.history.back());
   await page.getByRole("button", { name: "另存为并继续" }).click();
   expect((await saveAsResponse).status()).toBe(200);
-  await expect(page).toHaveURL("http://127.0.0.1:5173/");
+  await expect(page).toHaveURL(appUrl(page, "/"));
 });
 
 test("keeps a save-race draft on its original row across reordered extraction and a second save", async ({ page }) => {
