@@ -253,6 +253,92 @@ test("shows task progress, prevents a duplicate submit, and requests cancellatio
   expect(cancelRequested).toBe(true);
 });
 
+test("protects the session and dirty draft during browser back when recovery cache is off", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("link", { name: "可视化编辑器", exact: true }).click();
+  const docId = await openSample(page);
+  await page.locator("textarea").first().fill("BROWSER BACK DRAFT");
+  await expect(page.getByRole("button", { name: "开启草稿恢复" })).toBeVisible();
+
+  await page.evaluate(() => window.history.back());
+  await expect(page.getByRole("heading", { name: "有未保存的修改" })).toBeVisible();
+  await expect(page).toHaveURL(/\/editor$/);
+  await page.getByRole("button", { name: "取消", exact: true }).click();
+  await expect(page.locator("textarea").first()).toHaveValue("BROWSER BACK DRAFT");
+  await expect(page.getByText("editor-smoke.pdf", { exact: true })).toBeVisible();
+
+  const closeResponse = page.waitForResponse((response) =>
+    response.request().method() === "POST" && response.url().endsWith(`/edit/${docId}/close`),
+  );
+  await page.evaluate(() => window.history.back());
+  await page.getByRole("button", { name: "放弃草稿并继续" }).click();
+  await expect(page).toHaveURL("http://127.0.0.1:5173/");
+  expect((await closeResponse).status()).toBe(200);
+});
+
+test("protects dirty drafts during browser forward navigation", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("link", { name: "可视化编辑器", exact: true }).click();
+  await page.getByRole("link", { name: "全部工具", exact: true }).click();
+  await expect(page).toHaveURL("http://127.0.0.1:5173/");
+  await page.evaluate(() => window.history.back());
+  await expect(page).toHaveURL(/\/editor$/);
+  await openSample(page);
+  await page.locator("textarea").first().fill("BROWSER FORWARD DRAFT");
+
+  await page.evaluate(() => window.history.forward());
+  await expect(page.getByRole("heading", { name: "有未保存的修改" })).toBeVisible();
+  await expect(page).toHaveURL(/\/editor$/);
+  await page.getByRole("button", { name: "取消", exact: true }).click();
+  await expect(page.locator("textarea").first()).toHaveValue("BROWSER FORWARD DRAFT");
+
+  await page.evaluate(() => window.history.forward());
+  await page.getByRole("button", { name: "放弃草稿并继续" }).click();
+  await expect(page).toHaveURL("http://127.0.0.1:5173/");
+});
+
+test("keeps the editor session open when navigation is attempted during a save", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("link", { name: "可视化编辑器", exact: true }).click();
+  await openSample(page);
+  await page.locator("textarea").first().fill("SAVE IN PROGRESS");
+  const paused = await pauseNextSuccessfulMutation(page);
+
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await paused.reached;
+  await page.evaluate(() => window.history.back());
+  await expect(page.getByRole("heading", { name: "有未保存的修改" })).toBeVisible();
+  await expect(page).toHaveURL(/\/editor$/);
+  await expect(page.getByRole("button", { name: "放弃草稿并继续" })).toBeDisabled();
+  await page.getByRole("button", { name: "取消", exact: true }).click();
+  await expect(page.locator("textarea").first()).toHaveValue("SAVE IN PROGRESS");
+  await expect(page).toHaveURL(/\/editor$/);
+
+  paused.release();
+  await paused.stop();
+  await expect(page.getByText("已保存 1 处修改", { exact: true })).toBeVisible();
+  await expect(page.getByText("editor-smoke.pdf", { exact: true })).toBeVisible();
+});
+
+test("saves and exports the edited PDF before completing browser back navigation", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("link", { name: "可视化编辑器", exact: true }).click();
+  const docId = await openSample(page);
+  await page.locator("textarea").first().fill("SAVED BEFORE NAVIGATION");
+
+  page.once("dialog", (dialog) => { void dialog.accept("saved-before-navigation.pdf"); });
+  const saveAsResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return response.request().method() === "GET"
+      && url.pathname.endsWith(`/edit/${docId}/download`)
+      && url.searchParams.get("filename") === "saved-before-navigation.pdf";
+  }, { timeout: 15_000 });
+  await page.evaluate(() => window.history.back());
+  await page.getByRole("button", { name: "另存为并继续" }).click();
+  expect((await saveAsResponse).status()).toBe(200);
+  await expect(page).toHaveURL("http://127.0.0.1:5173/");
+});
+
 test("keeps a save-race draft on its original row across reordered extraction and a second save", async ({ page }) => {
   const docId = await openTwoLineSample(page);
   const paused = await pauseNextSuccessfulMutation(page);

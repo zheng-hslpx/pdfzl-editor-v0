@@ -1,9 +1,9 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileProvider } from "../contexts/FileContext";
 import { EditorPage } from "../pages/EditorPage";
-import { Link, MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { createMemoryRouter, Link, RouterProvider, useLocation } from "react-router-dom";
 
 const mocks = vi.hoisted(() => ({
   openEditor: vi.fn(),
@@ -68,26 +68,36 @@ const page = {
   }],
 };
 
-function renderEditor() {
+function renderEditor(initialEntries = ["/editor"]) {
   function LocationMarker() {
     const location = useLocation();
     return <span data-testid="route-location">{location.pathname}</span>;
   }
-  return render(
+  function EditorRoute() {
+    return (
+      <>
+        <LocationMarker />
+        <Link to="/other">离开编辑器</Link>
+        <EditorPage />
+      </>
+    );
+  }
+  function OtherRoute() {
+    return <><LocationMarker /><span>已离开编辑器</span></>;
+  }
+  const router = createMemoryRouter([
+    { path: "/editor", element: <EditorRoute /> },
+    { path: "/other", element: <OtherRoute /> },
+    { path: "*", element: <EditorRoute /> },
+  ], { initialEntries, initialIndex: initialEntries.length - 1 });
+  const result = render(
     <MantineProvider>
       <FileProvider>
-        <MemoryRouter initialEntries={["/editor"]}>
-          <LocationMarker />
-          <Link to="/other">离开编辑器</Link>
-          <Routes>
-            <Route path="/editor" element={<EditorPage />} />
-            <Route path="/other" element={<span>已离开编辑器</span>} />
-            <Route path="*" element={<EditorPage />} />
-          </Routes>
-        </MemoryRouter>
+        <RouterProvider router={router} />
       </FileProvider>
     </MantineProvider>,
   );
+  return { ...result, router };
 }
 
 async function openSample(container: HTMLElement) {
@@ -185,6 +195,25 @@ describe("editor dirty-draft protection", () => {
 
     fireEvent.click(screen.getByRole("link", { name: "离开编辑器" }));
     fireEvent.click(screen.getByRole("button", { name: "放弃草稿并继续" }));
+    expect(await screen.findByText("已离开编辑器")).toBeDefined();
+    expect(screen.getByTestId("route-location").textContent).toBe("/other");
+    await waitFor(() => expect(mocks.closeSession).toHaveBeenCalledWith("session-1"));
+  });
+
+  it("blocks history POP and keeps the editor session when navigation is cancelled", async () => {
+    const { container, router } = renderEditor(["/other", "/editor"]);
+    await openSample(container);
+    fireEvent.change(container.querySelector("textarea")!, { target: { value: "POP DRAFT" } });
+
+    act(() => { void router.navigate(-1); });
+    expect(await screen.findByText("有未保存的修改")).toBeDefined();
+    expect(screen.getByTestId("route-location").textContent).toBe("/editor");
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    expect((container.querySelector("textarea") as HTMLTextAreaElement).value).toBe("POP DRAFT");
+    expect(mocks.closeSession).not.toHaveBeenCalled();
+
+    act(() => { void router.navigate(-1); });
+    fireEvent.click(await screen.findByRole("button", { name: "放弃草稿并继续" }));
     expect(await screen.findByText("已离开编辑器")).toBeDefined();
     expect(screen.getByTestId("route-location").textContent).toBe("/other");
     await waitFor(() => expect(mocks.closeSession).toHaveBeenCalledWith("session-1"));

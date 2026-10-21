@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { BrowserRouter, Link, Route, Routes } from "react-router-dom";
+import { createBrowserRouter, Link, Outlet, RouterProvider } from "react-router-dom";
 import { AppShell, Badge, Burger, Group, Text, Title } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { FileProvider } from "./contexts/FileContext";
@@ -62,23 +62,29 @@ function Shell() {
       </AppShell.Navbar>
 
       <AppShell.Main>
-        <Routes>
-          <Route path="/" element={<Home />} />
-          <Route path="/tool/:toolId" element={<ToolPage />} />
-          <Route path="/editor" element={<EditorPage />} />
-          <Route path="*" element={<Home />} />
-        </Routes>
+        <Outlet />
       </AppShell.Main>
     </AppShell>
   );
 }
 
+const router = createBrowserRouter([
+  {
+    path: "/",
+    element: <Shell />,
+    children: [
+      { index: true, element: <Home /> },
+      { path: "tool/:toolId", element: <ToolPage /> },
+      { path: "editor", element: <EditorPage /> },
+      { path: "*", element: <Home /> },
+    ],
+  },
+]);
+
 export function App() {
   return (
     <FileProvider>
-      <BrowserRouter>
-        <Shell />
-      </BrowserRouter>
+      <RouterProvider router={router} />
     </FileProvider>
   );
 }

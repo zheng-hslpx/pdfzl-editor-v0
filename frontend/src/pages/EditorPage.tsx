@@ -26,7 +26,7 @@ import {
   IconZoomIn,
   IconZoomOut,
 } from "@tabler/icons-react";
-import { useNavigate } from "react-router-dom";
+import { useBlocker } from "react-router-dom";
 import type { PDFDocumentLoadingTask, PDFDocumentProxy } from "pdfjs-dist";
 import { openPdfDocument } from "../lib/pdfjs";
 import { findUniqueAnchoredLine, isAnchorForCurrentLine } from "../lib/draftAnchors";
@@ -95,7 +95,6 @@ function createPageSlots(pageCount: number, loaded: PageMeta[]): PageMeta[] {
 
 export function EditorPage() {
   const { files } = useFiles();
-  const navigate = useNavigate();
 
   // session state
   const [docId, setDocId] = useState<string | null>(null);
@@ -123,6 +122,15 @@ export function EditorPage() {
   const [edits, setEdits] = useState<Record<string, string>>({});
   const [dirty, setDirty] = useState(false);
   const [hasServerChanges, setHasServerChanges] = useState(false);
+  const shouldBlockNavigation = useCallback(({ currentLocation, nextLocation }: {
+    currentLocation: { pathname: string; search: string; hash: string };
+    nextLocation: { pathname: string; search: string; hash: string };
+  }) => (dirty || hasServerChanges) && (
+    currentLocation.pathname !== nextLocation.pathname
+    || currentLocation.search !== nextLocation.search
+    || currentLocation.hash !== nextLocation.hash
+  ), [dirty, hasServerChanges]);
+  const blocker = useBlocker(shouldBlockNavigation);
   const [busy, setBusy] = useState(false);
   const [pendingAction, setPendingAction] = useState<{
     run: () => Promise<void>;
@@ -1156,17 +1164,20 @@ export function EditorPage() {
 
   const continueAfterSave = useCallback(async () => {
     const pending = pendingAction;
-    if (!pending) return;
-    const shouldExport = pending.requireExport || hasServerChanges;
+    const blockedNavigation = blocker.state === "blocked";
+    if ((!pending && !blockedNavigation) || busy) return;
+    const shouldExport = Boolean(pending?.requireExport || hasServerChanges || blockedNavigation);
     if (dirty && !(await handleSave())) return;
     if (shouldExport && !(await handleSaveAs())) return;
     setPendingAction(null);
-    await pending.run();
-  }, [dirty, handleSave, handleSaveAs, hasServerChanges, pendingAction]);
+    if (pending) await pending.run();
+    if (blockedNavigation && blocker.state === "blocked") blocker.proceed();
+  }, [blocker, busy, dirty, handleSave, handleSaveAs, hasServerChanges, pendingAction]);
 
   const continueAfterDiscard = useCallback(async () => {
     const pending = pendingAction;
-    if (!pending) return;
+    const blockedNavigation = blocker.state === "blocked";
+    if ((!pending && !blockedNavigation) || busy) return;
     editsRef.current = {};
     draftAnchors.current = {};
     draftUndo.current = [];
@@ -1177,8 +1188,14 @@ export function EditorPage() {
     setDraftHistoryVersion((value) => value + 1);
     if (draftCacheEnabledRef.current) await persistLocalDraft(false, false);
     setPendingAction(null);
-    await pending.run();
-  }, [pendingAction, persistLocalDraft]);
+    if (pending) await pending.run();
+    if (blockedNavigation && blocker.state === "blocked") blocker.proceed();
+  }, [blocker, busy, pendingAction, persistLocalDraft]);
+
+  const cancelPendingAction = useCallback(() => {
+    setPendingAction(null);
+    if (blocker.state === "blocked") blocker.reset();
+  }, [blocker]);
 
   const closeCurrentFile = useCallback(async () => {
     if (!docId) return;
@@ -1226,25 +1243,6 @@ export function EditorPage() {
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
   }, [dirty, hasServerChanges]);
-
-  useEffect(() => {
-    const handler = (event: MouseEvent) => {
-      if (busy || (!dirty && !hasServerChanges)) return;
-      if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-      const target = event.target instanceof Element ? event.target.closest<HTMLAnchorElement>("a[href]") : null;
-      if (!target || target.target === "_blank" || target.hasAttribute("download")) return;
-      const url = new URL(target.href, window.location.href);
-      if (url.origin !== window.location.origin || url.href === window.location.href) return;
-      event.preventDefault();
-      event.stopPropagation();
-      setPendingAction({
-        run: async () => navigate(`${url.pathname}${url.search}${url.hash}`),
-        requireExport: hasServerChanges,
-      });
-    };
-    document.addEventListener("click", handler, true);
-    return () => document.removeEventListener("click", handler, true);
-  }, [busy, dirty, hasServerChanges, navigate]);
 
   useEffect(() => {
     if (!docId) return;
@@ -1543,26 +1541,26 @@ export function EditorPage() {
         </Stack>
       </Modal>
       <Modal
-        opened={pendingAction !== null}
-        onClose={() => setPendingAction(null)}
+        opened={pendingAction !== null || blocker.state === "blocked"}
+        onClose={cancelPendingAction}
         title="有未保存的修改"
         centered
       >
         <Stack gap="sm">
           <Text size="sm">
-            {pendingAction?.requireExport || hasServerChanges
+            {pendingAction?.requireExport || hasServerChanges || blocker.state === "blocked"
               ? "当前编辑只保存在临时会话中。保存会先提交文字草稿，再另存为文件。"
               : "继续操作前需要处理文字草稿。"}
           </Text>
           <Group justify="flex-end">
-            <Button variant="default" onClick={() => setPendingAction(null)}>
+            <Button variant="default" onClick={cancelPendingAction}>
               取消
             </Button>
-            <Button color="red" variant="light" onClick={() => void continueAfterDiscard()}>
+            <Button color="red" variant="light" disabled={busy} onClick={() => void continueAfterDiscard()}>
               放弃草稿并继续
             </Button>
-            <Button onClick={() => void continueAfterSave()}>
-              {pendingAction?.requireExport || hasServerChanges ? "另存为并继续" : "保存并继续"}
+            <Button disabled={busy} onClick={() => void continueAfterSave()}>
+              {pendingAction?.requireExport || hasServerChanges || blocker.state === "blocked" ? "另存为并继续" : "保存并继续"}
             </Button>
           </Group>
         </Stack>
