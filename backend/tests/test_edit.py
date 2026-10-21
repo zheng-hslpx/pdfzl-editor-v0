@@ -233,6 +233,80 @@ def test_replace_text_roundtrip(client, sample_pdf):
     out.close()
 
 
+def test_apply_batch_replaces_multiple_regions_and_deletes_empty(client, tmp_path):
+    source_path = tmp_path / "multi-line-batch.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=500)
+    page.insert_text((40, 70), "FIRST ORIGINAL", fontsize=14)
+    page.insert_text((40, 110), "SECOND ORIGINAL", fontsize=14)
+    page.insert_text((40, 150), "中文原文", fontsize=14, fontname="china-s")
+    page.insert_text((40, 190), "DELETE EMPTY", fontsize=14)
+    page.insert_text((40, 230), "KEEP ORIGINAL", fontsize=14)
+    doc.save(source_path)
+    doc.close()
+
+    data = _open(client, source_path)
+    page_lines = data["textModel"][0]["lines"]
+    replacements = {
+        "FIRST ORIGINAL": "REPLACEMENT ONE",
+        "SECOND ORIGINAL": "第二行替换",
+        "中文原文": "你好世界",
+        "DELETE EMPTY": "",
+    }
+    edits = [
+        _edit_payload(next(line for line in page_lines if needle in line["text"]), 0, value)
+        for needle, value in replacements.items()
+    ]
+    job, _ = submit_job(
+        client,
+        f"/api/v1/edit/{data['docId']}/apply",
+        json={"expectedRevision": data["revision"], "edits": edits},
+    )
+
+    assert job["state"] == "succeeded", job.get("error")
+    assert job["result"]["revision"] == data["revision"] + 1
+    out = _download(client, data["docId"])
+    text = out[0].get_text()
+    for replacement in ("REPLACEMENT ONE", "第二行替换", "你好世界", "KEEP ORIGINAL"):
+        assert replacement in text
+    for original in ("FIRST ORIGINAL", "SECOND ORIGINAL", "中文原文", "DELETE EMPTY"):
+        assert original not in text
+    out.close()
+
+
+def test_apply_batch_rejects_overlapping_regions_without_partial_commit(client, tmp_path):
+    source_path = tmp_path / "overlapping-batch.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=500)
+    page.insert_text((40, 70), "OVERLAP ORIGINAL", fontsize=14)
+    page.insert_text((40, 120), "UNCHANGED SECOND ROW", fontsize=14)
+    doc.save(source_path)
+    doc.close()
+
+    data = _open(client, source_path)
+    line = next(line for line in data["textModel"][0]["lines"] if "OVERLAP ORIGINAL" in line["text"])
+    before = client.get(f"/api/v1/edit/{data['docId']}/download").content
+    job, _ = submit_job(
+        client,
+        f"/api/v1/edit/{data['docId']}/apply",
+        json={
+            "expectedRevision": data["revision"],
+            "edits": [
+                _edit_payload(line, 0, "FIRST OVERLAPPING VALUE"),
+                _edit_payload(line, 0, "SECOND OVERLAPPING VALUE"),
+            ],
+        },
+    )
+
+    assert job["state"] == "failed"
+    assert job["error"]["code"] == "OVERLAPPING_EDITS"
+    assert client.get(f"/api/v1/edit/{data['docId']}/download").content == before
+    page_after = client.get(f"/api/v1/edit/{data['docId']}/pages/0/text").json()
+    assert page_after["revision"] == data["revision"]
+    assert any(item["text"] == "OVERLAP ORIGINAL" for item in page_after["page"]["lines"])
+    assert any(item["text"] == "UNCHANGED SECOND ROW" for item in page_after["page"]["lines"])
+
+
 def test_replace_with_chinese(client, sample_pdf):
     data = _open(client, sample_pdf)
     doc_id = data["docId"]

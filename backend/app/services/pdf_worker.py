@@ -109,7 +109,12 @@ def _unknown_pdf_info(path: Path) -> dict[str, Any]:
     }
 
 
-def _validate_anchor(doc: fitz.Document, page_ids: list[str], edit: dict) -> fitz.Page:
+def _validate_anchor(
+    doc: fitz.Document,
+    page_ids: list[str],
+    edit: dict,
+    page_text_models: dict[int, dict] | None = None,
+) -> fitz.Page:
     page_no = int(edit["page"])
     if not (0 <= page_no < doc.page_count) or page_no >= len(page_ids):
         raise PdfError(409, "页面身份已变化，请重新定位草稿", code="REVISION_CONFLICT")
@@ -127,7 +132,11 @@ def _validate_anchor(doc: fitz.Document, page_ids: list[str], edit: dict) -> fit
 
     from ..routers.edit import extract_page_text_model
 
-    model = extract_page_text_model(doc, page_no, page_ids[page_no])
+    model = page_text_models.get(page_no) if page_text_models is not None else None
+    if model is None:
+        model = extract_page_text_model(doc, page_no, page_ids[page_no])
+        if page_text_models is not None:
+            page_text_models[page_no] = model
     line = next((row for row in model["lines"] if row["id"] == edit.get("lineId")), None)
     bbox = edit.get("bbox") or []
     if (
@@ -139,6 +148,47 @@ def _validate_anchor(doc: fitz.Document, page_ids: list[str], edit: dict) -> fit
     ):
         raise PdfError(409, "文本行已变化，请重新定位草稿", code="REVISION_CONFLICT")
     return page
+
+
+def _prepare_editor_batch(
+    doc: fitz.Document,
+    page_ids: list[str],
+    edits: list[dict],
+) -> list[dict[str, Any]]:
+    page_text_models: dict[int, dict] = {}
+    prepared: list[dict[str, Any]] = []
+    for edit in edits:
+        page = _validate_anchor(doc, page_ids, edit, page_text_models)
+        bbox = fitz.Rect(edit["bbox"])
+        if not page.rect.contains(bbox):
+            raise PdfError(422, "编辑区域超出页面范围", code="INVALID_BBOX")
+        text = str(edit.get("text", ""))
+        whiteout = edit.get("kind") == "cover" or not text.strip()
+        prepared.append({
+            "edit": edit,
+            "page_no": int(edit["page"]),
+            "bbox": bbox,
+            "text": text,
+            "whiteout": whiteout,
+            "no_op": edit.get("kind") == "text" and not whiteout and text == edit.get("original"),
+        })
+
+    active = [item for item in prepared if not item["no_op"]]
+    for index, first in enumerate(active):
+        a = first["bbox"]
+        for second in active[index + 1:]:
+            if first["page_no"] != second["page_no"]:
+                continue
+            b = second["bbox"]
+            overlap_width = min(a.x1, b.x1) - max(a.x0, b.x0)
+            overlap_height = min(a.y1, b.y1) - max(a.y0, b.y0)
+            if overlap_width > 0 and overlap_height > 0:
+                raise PdfError(
+                    422,
+                    "同一页的编辑区域重叠，请调整范围后重试",
+                    code="OVERLAPPING_EDITS",
+                )
+    return prepared
 
 
 def _save_document(doc: fitz.Document, output: Path, **options) -> None:
@@ -288,24 +338,30 @@ def _run_operation(operation: str, payload: dict[str, Any], work_dir: Path,
         try:
             _check_cancel(cancel_event)
             if operation == "editor_apply":
-                for edit in payload["edits"]:
+                prepared = _prepare_editor_batch(doc, page_ids, payload["edits"])
+                for item in prepared:
+                    edit = item["edit"]
                     if edit.get("pageId"):
                         changed_page_ids.add(edit["pageId"])
-                    page = _validate_anchor(doc, page_ids, edit)
-                    bbox = fitz.Rect(edit["bbox"])
-                    if not page.rect.contains(bbox):
-                        raise PdfError(422, "编辑区域超出页面范围", code="INVALID_BBOX")
-                    text = str(edit.get("text", ""))
-                    whiteout = edit.get("kind") == "cover" or not text.strip()
-                    if edit.get("kind") == "text" and not whiteout and text == edit.get("original"):
+                    if item["no_op"]:
                         continue
-                    page.add_redact_annot(bbox, fill=(1, 1, 1))
-                    page.apply_redactions(
+                    doc[item["page_no"]].add_redact_annot(item["bbox"], fill=(1, 1, 1))
+                edited_pages = {item["page_no"] for item in prepared if not item["no_op"]}
+                for page_no in sorted(edited_pages):
+                    doc[page_no].apply_redactions(
                         images=fitz.PDF_REDACT_IMAGE_NONE,
                         graphics=fitz.PDF_REDACT_LINE_ART_NONE,
                     )
-                    if whiteout:
-                        page.draw_rect(bbox, color=None, fill=(1, 1, 1))
+                for item in prepared:
+                    if item["no_op"]:
+                        continue
+                    edit = item["edit"]
+                    page = doc[item["page_no"]]
+                    bbox = item["bbox"]
+                    text = item["text"]
+                    if item["whiteout"]:
+                        if edit.get("kind") != "cover":
+                            page.draw_rect(bbox, color=None, fill=(1, 1, 1))
                         continue
                     font = pdf_engine.pick_font(text)
                     size = float(edit.get("fontSize") or max(bbox.height * 0.8, 6))
