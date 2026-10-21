@@ -235,12 +235,20 @@ describe("editor dirty-draft protection", () => {
     const textbox = container.querySelector("textarea") as HTMLTextAreaElement;
     expect(textbox.readOnly).toBe(false);
     fireEvent.change(textbox, { target: { value: "NEWER LOCAL TEXT" } });
+    mocks.fetchPageText.mockResolvedValue({
+      docId: "session-1",
+      revision: 1,
+      page: {
+        ...page,
+        lines: [{ ...page.lines[0]!, id: "page-1:l1", text: "SUBMITTED TEXT", originalHash: "hash-submitted" }],
+      },
+    });
     finishSave({
       ok: true,
       pageCount: 1,
       revision: 1,
       pages: [{ page: 0, pageId: "page-1", width: 595, height: 842, rotation: 0 }],
-      changedPageIds: [],
+      changedPageIds: ["page-1"],
     });
 
     await waitFor(() => expect((container.querySelector("textarea") as HTMLTextAreaElement).value).toBe("NEWER LOCAL TEXT"));

@@ -6,10 +6,12 @@ import { expect, test, type Page } from "@playwright/test";
 
 let fixtureDirectory = "";
 let fixturePath = "";
+let raceFixturePath = "";
 
 test.beforeAll(() => {
   fixtureDirectory = mkdtempSync(join(tmpdir(), "pdfed-e2e-"));
   fixturePath = join(fixtureDirectory, "editor-smoke.pdf");
+  raceFixturePath = join(fixtureDirectory, "editor-race.pdf");
   const python = process.env.PYTHON ?? (process.platform === "win32" ? "python" : "python3");
   const source = [
     "import fitz, sys",
@@ -23,8 +25,14 @@ test.beforeAll(() => {
     "page.insert_text((72, 100), 'PAGE-3 EDITABLE', fontsize=14)",
     "doc.save(sys.argv[1])",
     "doc.close()",
+    "race = fitz.open()",
+    "race_page = race.new_page(width=400, height=500)",
+    "race_page.insert_text((40, 70), 'PAGE1 FIRST ORIGINAL', fontsize=14)",
+    "race_page.insert_text((40, 110), 'PAGE1 SECOND ORIGINAL', fontsize=14)",
+    "race.save(sys.argv[2])",
+    "race.close()",
   ].join("; ");
-  execFileSync(python, ["-c", source, fixturePath], { stdio: "pipe" });
+  execFileSync(python, ["-c", source, fixturePath, raceFixturePath], { stdio: "pipe" });
 });
 
 test.afterAll(() => {
@@ -49,6 +57,79 @@ async function openSample(page: Page): Promise<string> {
   await expect(page.getByText("editor-smoke.pdf", { exact: true })).toBeVisible();
   await expect(page.locator("textarea").first()).toHaveValue("PAGE-1 EDITABLE");
   return match[1]!;
+}
+
+async function openTwoLineSample(page: Page): Promise<string> {
+  await page.goto("/editor");
+  const pdfRequest = page.waitForRequest(
+    (request) => /\/api\/v1\/edit\/[^/]+\/download(?:\?|$)/.test(request.url()),
+    { timeout: 30_000 },
+  );
+  await page.locator('input[type="file"][accept=".pdf,application/pdf"]').setInputFiles(raceFixturePath);
+  const request = await pdfRequest;
+  const match = /\/api\/v1\/edit\/([^/]+)\/download/.exec(new URL(request.url()).pathname);
+  if (!match) throw new Error("Editor PDF range request did not include a docId");
+  await expect(page.getByText("editor-race.pdf", { exact: true })).toBeVisible();
+  await expect(page.locator("textarea")).toHaveCount(2);
+  await expect(page.locator("textarea").nth(0)).toHaveValue("PAGE1 FIRST ORIGINAL");
+  await expect(page.locator("textarea").nth(1)).toHaveValue("PAGE1 SECOND ORIGINAL");
+  return match[1]!;
+}
+
+async function pauseNextSuccessfulMutation(page: Page) {
+  let release!: () => void;
+  let resolveReached!: (job: Record<string, unknown>) => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const reached = new Promise<Record<string, unknown>>((resolve) => { resolveReached = resolve; });
+  let paused = false;
+  const handler = async (route: import("@playwright/test").Route) => {
+    const response = await route.fetch();
+    const body = await response.text();
+    const job = JSON.parse(body) as Record<string, unknown>;
+    const result = job.result as Record<string, unknown> | undefined;
+    if (!paused && job.state === "succeeded" && typeof result?.revision === "number") {
+      paused = true;
+      resolveReached(job);
+      await gate;
+    }
+    await route.fulfill({ response, body });
+  };
+  await page.route((url) => /\/api\/v1\/jobs\/[^/]+$/.test(new URL(url).pathname), handler);
+  return {
+    reached,
+    release,
+    stop: () => page.unroute((url) => /\/api\/v1\/jobs\/[^/]+$/.test(new URL(url).pathname), handler),
+  };
+}
+
+async function waitForJob(page: Page, jobId: string): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const response = await page.request.get(`http://127.0.0.1:8000/api/v1/jobs/${jobId}`);
+    const job = await response.json() as Record<string, unknown>;
+    if (["succeeded", "failed", "cancelled"].includes(String(job.state))) return job;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`job ${jobId} did not finish in time`);
+}
+
+async function fetchPageText(page: Page, docId: string) {
+  const response = await page.request.get(`http://127.0.0.1:8000/api/v1/edit/${docId}/pages/0/text`);
+  expect(response.status()).toBe(200);
+  return await response.json() as {
+    revision: number;
+    page: {
+      pageId: string;
+      lines: Array<{
+        id: string;
+        pageId: string;
+        originalHash: string;
+        bbox: number[];
+        fontSize: number;
+        text: string;
+      }>;
+    };
+  };
 }
 
 test("protects dirty navigation, supports undo/redo, detects stale revisions, saves as, and closes", async ({ page }) => {
@@ -170,4 +251,87 @@ test("shows task progress, prevents a duplicate submit, and requests cancellatio
   await page.getByRole("button", { name: "取消任务" }).click();
   await expect(page.getByText("任务已取消", { exact: true })).toBeVisible();
   expect(cancelRequested).toBe(true);
+});
+
+test("keeps a save-race draft on its original row across reordered extraction and a second save", async ({ page }) => {
+  const docId = await openTwoLineSample(page);
+  const paused = await pauseNextSuccessfulMutation(page);
+
+  await page.locator("textarea").nth(0).fill("FIRST SAVED VALUE");
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  const firstJob = await paused.reached;
+  expect((firstJob.result as { revision: number }).revision).toBe(1);
+
+  const afterFirstSave = await fetchPageText(page, docId);
+  expect(afterFirstSave.revision).toBe(1);
+  expect(afterFirstSave.page.lines.map((line) => line.text)).toEqual([
+    "PAGE1 SECOND ORIGINAL",
+    "FIRST SAVED VALUE",
+  ]);
+
+  await page.locator("textarea").nth(0).fill("FIRST NEW INPUT DURING SAVE");
+  paused.release();
+  await expect(page.locator("textarea").nth(0)).toHaveValue("PAGE1 SECOND ORIGINAL");
+  await expect(page.locator("textarea").nth(1)).toHaveValue("FIRST NEW INPUT DURING SAVE");
+  await expect(page.getByText(/保存期间的新修改仍保留/)).toBeVisible();
+  await paused.stop();
+
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(page.getByText("已保存 1 处修改", { exact: true })).toBeVisible();
+  const afterSecondSave = await fetchPageText(page, docId);
+  expect(afterSecondSave.revision).toBe(2);
+  const firstRow = afterSecondSave.page.lines.find((line) => line.text === "FIRST NEW INPUT DURING SAVE");
+  const secondRow = afterSecondSave.page.lines.find((line) => line.text === "PAGE1 SECOND ORIGINAL");
+  expect(firstRow).toBeDefined();
+  expect(secondRow).toBeDefined();
+  expect(firstRow!.bbox[1]).toBeLessThan(80);
+  expect(secondRow!.bbox[1]).toBeGreaterThan(80);
+  expect(afterSecondSave.page.lines.some((line) => line.text === "FIRST SAVED VALUE")).toBe(false);
+});
+
+test("preserves a save-race draft as a visible conflict when its document version changes", async ({ page }) => {
+  const docId = await openTwoLineSample(page);
+  const paused = await pauseNextSuccessfulMutation(page);
+
+  await page.locator("textarea").nth(0).fill("FIRST SAVED VALUE");
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  const firstJob = await paused.reached;
+  expect((firstJob.result as { revision: number }).revision).toBe(1);
+  await page.locator("textarea").nth(0).fill("FIRST NEW INPUT DURING SAVE");
+
+  const afterFirstSave = await fetchPageText(page, docId);
+  const savedFirstRow = afterFirstSave.page.lines.find((line) => line.text === "FIRST SAVED VALUE");
+  expect(savedFirstRow).toBeDefined();
+  const externalResponse = await page.request.post(`http://127.0.0.1:8000/api/v1/edit/${docId}/apply`, {
+    data: {
+      expectedRevision: 1,
+      edits: [{
+        page: 0,
+        pageId: savedFirstRow!.pageId,
+        lineId: savedFirstRow!.id,
+        originalHash: savedFirstRow!.originalHash,
+        bbox: savedFirstRow!.bbox,
+        original: savedFirstRow!.text,
+        text: "EXTERNAL VERSION",
+        fontSize: savedFirstRow!.fontSize,
+      }],
+    },
+    headers: { "Idempotency-Key": `save-race-conflict-${Date.now()}` },
+  });
+  expect(externalResponse.status()).toBe(202);
+  const externalJob = await waitForJob(page, (await externalResponse.json()).jobId as string);
+  expect(externalJob.state).toBe("succeeded");
+
+  paused.release();
+  await expect(page.getByText("草稿定位冲突", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("anchor-conflict-text")).toContainText("FIRST NEW INPUT DURING SAVE");
+  await paused.stop();
+
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(page.getByText(/无法安全定位的冲突草稿/)).toBeVisible();
+  const currentPage = await fetchPageText(page, docId);
+  expect(currentPage.revision).toBe(2);
+  expect(currentPage.page.lines.some((line) => line.text === "EXTERNAL VERSION")).toBe(true);
+  expect(currentPage.page.lines.some((line) => line.text === "PAGE1 SECOND ORIGINAL")).toBe(true);
+  expect(currentPage.page.lines.some((line) => line.text === "FIRST NEW INPUT DURING SAVE")).toBe(false);
 });

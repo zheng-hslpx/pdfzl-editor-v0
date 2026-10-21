@@ -29,6 +29,7 @@ import {
 import { useNavigate } from "react-router-dom";
 import type { PDFDocumentLoadingTask, PDFDocumentProxy } from "pdfjs-dist";
 import { openPdfDocument } from "../lib/pdfjs";
+import { findUniqueAnchoredLine, isAnchorForCurrentLine } from "../lib/draftAnchors";
 import { formatSize, useFiles } from "../contexts/FileContext";
 import * as editorApi from "../api/editor";
 import {
@@ -76,6 +77,8 @@ const FONT_STYLES: Record<string, { family: string; weight?: number; style?: str
 interface LineWithPage extends TextLine {
   page: number;
 }
+
+const ANCHOR_CONFLICT_PREFIX = "__anchor_conflict__:";
 
 function createPageSlots(pageCount: number, loaded: PageMeta[]): PageMeta[] {
   const known = new Map(loaded.map((page) => [page.page, page]));
@@ -137,6 +140,7 @@ export function EditorPage() {
   const draftRedo = useRef<Record<string, string>[]>([]);
   const [, setDraftHistoryVersion] = useState(0);
   const [savingDraft, setSavingDraft] = useState(false);
+  const [reconcilingDraftAnchors, setReconcilingDraftAnchors] = useState(false);
   const [draftCacheEnabled, setDraftCacheEnabled] = useState(false);
   const [draftCacheStatus, setDraftCacheStatus] = useState<"disabled" | "saving" | "saved" | "error">("disabled");
   const [cacheConfirmOpen, setCacheConfirmOpen] = useState(false);
@@ -197,6 +201,9 @@ export function EditorPage() {
 
   const draftAnchorsForCurrentEdits = useCallback((): DraftAnchor[] => {
     return Object.entries(editsRef.current).flatMap(([lineId, text]) => {
+      if (lineId.startsWith(ANCHOR_CONFLICT_PREFIX)) {
+        throw new Error("存在无法安全定位的冲突草稿，未写入本地缓存");
+      }
       const anchor = draftAnchors.current[lineId];
       if (!anchor) throw new Error("有文字草稿缺少定位信息，缓存未保存");
       return text !== anchor.original ? [{ ...anchor, lineId, bbox: [...anchor.bbox], text }] : [];
@@ -222,8 +229,14 @@ export function EditorPage() {
         if (!blob) throw new Error("没有可缓存的文档内容");
         const anchorsByPage = new Map<number, Array<[string, string, DraftAnchor]>>();
         for (const [lineId, text] of Object.entries(editsRef.current)) {
+          if (lineId.startsWith(ANCHOR_CONFLICT_PREFIX)) {
+            throw new Error("存在无法安全定位的冲突草稿，未写入本地缓存");
+          }
           const anchor = draftAnchors.current[lineId];
           if (!anchor) throw new Error("有文字草稿缺少定位信息，缓存未保存");
+          if (anchor.revision !== expectedRevision) {
+            throw new Error("草稿锚点与当前文档版本不一致，缓存未保存");
+          }
           const group = anchorsByPage.get(anchor.page) ?? [];
           group.push([lineId, text, anchor]);
           anchorsByPage.set(anchor.page, group);
@@ -234,18 +247,16 @@ export function EditorPage() {
             throw new Error("文档版本已变化，草稿缓存未保存");
           }
           for (const [lineId, text, anchor] of entries) {
-            const line = response.page.lines.find((item) => item.id === (anchor.lineId || lineId))
-              ?? response.page.lines
-                .map((item) => ({
-                  item,
-                  distance: item.bbox.reduce((sum, value, index) => sum + Math.abs(value - (anchor.bbox[index] ?? value)), 0),
-                }))
-                .filter((item) => item.distance <= 4)
-                .sort((a, b) => a.distance - b.distance)[0]?.item;
+            if (response.page.pageId !== anchor.pageId) {
+              throw new Error("草稿页面身份已变化，缓存未保存");
+            }
+            const line = findUniqueAnchoredLine(response.page.lines, anchor);
             if (!line) throw new Error("有文字草稿无法重新定位，缓存未保存");
             draftAnchors.current[lineId] = {
               lineId: line.id,
               page: pageNo,
+              pageId: line.pageId,
+              revision: response.revision,
               originalHash: line.originalHash,
               bbox: [...line.bbox],
               original: line.text,
@@ -408,21 +419,12 @@ export function EditorPage() {
           response.revision !== revision ||
           response.page.pageId !== meta.pageId
         ) return;
-        for (const line of response.page.lines) {
-          if (Object.prototype.hasOwnProperty.call(editsRef.current, line.id)) {
-            draftAnchors.current[line.id] = {
-              lineId: line.id,
-              page: pageNo,
-              originalHash: line.originalHash,
-              bbox: [...line.bbox],
-              original: line.text,
-              text: editsRef.current[line.id]!,
-            };
-          }
-        }
         const hasDraft = Object.keys(editsRef.current).some((lineId) => lineId.startsWith(`${meta.pageId}:`));
         if (visiblePages.current.has(pageNo) || retainAllTextModels.current || hasDraft) {
-          updatePageModels((previous) => ({ ...previous, [meta.pageId]: response.page }));
+          updatePageModels((previous) => ({
+            ...previous,
+            [meta.pageId]: { ...response.page, revision: response.revision },
+          }));
         }
       }).finally(() => pageTextRequests.current.delete(key));
       pageTextRequests.current.set(key, request);
@@ -537,9 +539,49 @@ export function EditorPage() {
 
   const cancelEditorJob = useCallback(() => jobController.current?.abort(), []);
 
+  const discardAnchorConflict = useCallback((lineId: string) => {
+    if (!lineId.startsWith(ANCHOR_CONFLICT_PREFIX)) return;
+    const next = { ...editsRef.current };
+    delete next[lineId];
+    editsRef.current = next;
+    delete draftAnchors.current[lineId];
+    const withoutConflict = (values: Record<string, string>) => {
+      const copy = { ...values };
+      delete copy[lineId];
+      return copy;
+    };
+    draftUndo.current = draftUndo.current.map(withoutConflict);
+    draftRedo.current = draftRedo.current.map(withoutConflict);
+    if (draftEditBurst.current?.lineId === lineId) draftEditBurst.current = null;
+    setEdits(next);
+    setDirty(Object.keys(next).length > 0);
+    setDraftHistoryVersion((value) => value + 1);
+    if (draftCacheEnabledRef.current) {
+      if (Object.keys(next).length === 0) void clearDocumentCache();
+      else void persistLocalDraft(true, false);
+    }
+  }, [clearDocumentCache, persistLocalDraft]);
+
   const allLines: LineWithPage[] = useMemo(
     () => Object.values(pageModels).flatMap((page) => page.lines.map((line) => ({ ...line, page: page.page }))),
     [pageModels],
+  );
+
+  const visibleDrafts = useMemo(() => {
+    const linesById = new Map(allLines.map((line) => [line.id, line]));
+    return Object.fromEntries(Object.entries(edits).filter(([lineId]) => {
+      if (lineId.startsWith(ANCHOR_CONFLICT_PREFIX)) return false;
+      const anchor = draftAnchors.current[lineId];
+      const line = linesById.get(lineId);
+      return Boolean(anchor && line && isAnchorForCurrentLine(anchor, line, revisionRef.current));
+    }));
+  }, [allLines, edits]);
+
+  const anchorConflictDrafts = useMemo(
+    () => Object.entries(edits)
+      .filter(([lineId]) => lineId.startsWith(ANCHOR_CONFLICT_PREFIX))
+      .map(([lineId, text]) => ({ lineId, text, anchor: draftAnchors.current[lineId] })),
+    [edits],
   );
 
   const applyDraftValue = useCallback((lineId: string, text: string, recordUndo = true) => {
@@ -691,6 +733,7 @@ export function EditorPage() {
           width: meta.width,
           height: meta.height,
           rotation: meta.rotation,
+          revision: result.revision,
         };
       }
       replacePageModels(nextModels);
@@ -803,15 +846,16 @@ export function EditorPage() {
           }
           const used = new Set<string>();
           for (const anchor of anchors) {
-            const line = response.page.lines
-              .filter((candidate) => !used.has(candidate.id) && candidate.originalHash === anchor.originalHash)
-              .map((candidate) => ({
-                candidate,
-                distance: candidate.bbox.reduce((sum, value, index) => sum + Math.abs(value - (anchor.bbox[index] ?? value)), 0),
-              }))
-              .filter((item) => item.distance <= 4)
-              .sort((a, b) => a.distance - b.distance)[0]?.candidate;
-            if (!line) {
+            const restoredAnchor = {
+              ...anchor,
+              pageId: response.page.pageId,
+              revision: response.revision,
+            };
+            const line = findUniqueAnchoredLine(
+              response.page.lines.filter((candidate) => !used.has(candidate.id)),
+              restoredAnchor,
+            );
+            if (!line || response.page.page !== pageNo) {
               unmatched += 1;
               continue;
             }
@@ -820,6 +864,8 @@ export function EditorPage() {
             restoredAnchors[line.id] = {
               lineId: line.id,
               page: pageNo,
+              pageId: line.pageId,
+              revision: response.revision,
               originalHash: line.originalHash,
               bbox: [...line.bbox],
               original: line.text,
@@ -897,39 +943,42 @@ export function EditorPage() {
 
   const handleSave = useCallback(async (): Promise<boolean> => {
     if (!docId) return false;
+    if (Object.keys(editsRef.current).some((lineId) => lineId.startsWith(ANCHOR_CONFLICT_PREFIX))) {
+      notify("存在无法安全定位的冲突草稿；草稿已保留，请先复制或放弃冲突草稿");
+      return false;
+    }
     const submittedEdits = { ...editsRef.current };
     setBusy(true);
     setSavingDraft(true);
     try {
       const expectedRevision = revisionRef.current;
       const lines = new Map<string, LineWithPage>();
-      for (const model of Object.values(pageModelsRef.current)) {
-        for (const line of model.lines) lines.set(line.id, { ...line, page: model.page });
-      }
       for (const lineId of Object.keys(submittedEdits)) {
-        if (lines.has(lineId)) continue;
         const anchor = draftAnchors.current[lineId];
-        const pageNo = anchor?.page ?? pagesRef.current.find((page) => lineId.startsWith(`${page.pageId}:`))?.page;
-        if (pageNo === undefined) throw new Error("有一处草稿无法定位到原页面，草稿已保留");
-        const response = await editorApi.fetchPageText(docId, pageNo);
-        if (response.revision !== expectedRevision || revisionRef.current !== expectedRevision) {
-          throw new Error("文档版本已变化，草稿未保存且仍保留在编辑器中");
+        if (!anchor || anchor.revision !== expectedRevision) {
+          throw new Error("草稿锚点与当前文档版本不一致，草稿未保存且仍保留在编辑器中");
         }
-        const match = response.page.lines.find((line) => line.id === lineId)
-          ?? (anchor && response.page.lines.find((line) =>
-            line.originalHash === anchor.originalHash
-            && line.bbox.every((value, index) => Math.abs(value - (anchor.bbox[index] ?? value)) <= 1),
-          ));
-        if (!match) throw new Error("草稿锚点已变化，草稿未保存且仍保留在编辑器中");
-        lines.set(lineId, { ...match, page: pageNo });
-        draftAnchors.current[lineId] = {
-          lineId: match.id,
-          page: pageNo,
-          originalHash: match.originalHash,
-          bbox: [...match.bbox],
-          original: match.text,
-          text: submittedEdits[lineId]!,
-        };
+        const pageMeta = pagesRef.current[anchor.page];
+        if (!pageMeta || pageMeta.pageId !== anchor.pageId) {
+          throw new Error("草稿页面身份已变化，草稿未保存且仍保留在编辑器中");
+        }
+        let pageModel = pageModelsRef.current[anchor.pageId];
+        if (!pageModel || pageModel.revision !== expectedRevision || pageModel.page !== anchor.page) {
+          const response = await editorApi.fetchPageText(docId, anchor.page);
+          if (
+            response.revision !== expectedRevision
+            || revisionRef.current !== expectedRevision
+            || response.page.pageId !== anchor.pageId
+            || response.page.page !== anchor.page
+          ) {
+            throw new Error("文档版本已变化，草稿未保存且仍保留在编辑器中");
+          }
+          pageModel = { ...response.page, revision: response.revision };
+          updatePageModels((previous) => ({ ...previous, [anchor.pageId]: pageModel! }));
+        }
+        const match = findUniqueAnchoredLine(pageModel.lines, anchor);
+        if (!match) throw new Error("草稿锚点已变化或不唯一，草稿未保存且仍保留在编辑器中");
+        lines.set(lineId, { ...match, page: anchor.page });
       }
       const changed = Object.entries(submittedEdits).filter(([id, text]) => lines.get(id)?.text !== text);
       if (changed.length === 0) {
@@ -960,26 +1009,133 @@ export function EditorPage() {
         editorApi.applyEdits(docId, expectedRevision, payload, options),
       );
       await applyResult(result, false);
+      setReconcilingDraftAnchors(true);
       const remaining = { ...editsRef.current };
       for (const [id, submittedText] of Object.entries(submittedEdits)) {
         if (remaining[id] === submittedText) delete remaining[id];
       }
-      editsRef.current = remaining;
-      setEdits(remaining);
-      setDirty(Object.keys(remaining).length > 0);
-      if (draftCacheEnabledRef.current) void persistLocalDraft(true, false);
-      notify(Object.keys(remaining).length
-        ? `已提交 ${changed.length} 处修改；保存期间的新修改仍保留，请再次保存`
-        : `已保存 ${changed.length} 处修改`);
-      return Object.keys(remaining).length === 0;
+
+      const historyKeys = [...draftUndo.current, ...draftRedo.current].flatMap((state) => Object.keys(state));
+      const identityKeys = [...new Set([...Object.keys(remaining), ...historyKeys])]
+        .filter((lineId) => draftAnchors.current[lineId] !== undefined);
+      const anchorsToReconcile = identityKeys.flatMap((lineId) => {
+        const anchor = draftAnchors.current[lineId];
+        return anchor ? [{ lineId, anchor }] : [];
+      });
+      const pageResponses = new Map<number, editorApi.PageTextResult | null>();
+      for (const { anchor } of anchorsToReconcile) {
+        if (pageResponses.has(anchor.page)) continue;
+        try {
+          const response = await editorApi.fetchPageText(docId, anchor.page);
+          pageResponses.set(anchor.page,
+            response.revision === result.revision
+              && revisionRef.current === result.revision
+              && response.page.page === anchor.page
+              ? response
+              : null,
+          );
+        } catch {
+          pageResponses.set(anchor.page, null);
+        }
+      }
+
+      const candidateByKey = new Map<string, TextLine | null>();
+      for (const { lineId, anchor } of anchorsToReconcile) {
+        const response = pageResponses.get(anchor.page);
+        const pageMeta = pagesRef.current[anchor.page];
+        if (
+          anchor.revision !== expectedRevision
+          || !pageMeta
+          || pageMeta.pageId !== anchor.pageId
+          || !response
+          || response.page.pageId !== anchor.pageId
+        ) {
+          candidateByKey.set(lineId, null);
+          continue;
+        }
+        const expectedText = Object.prototype.hasOwnProperty.call(submittedEdits, lineId)
+          ? submittedEdits[lineId]!
+          : anchor.original;
+        candidateByKey.set(lineId, findUniqueAnchoredLine(response.page.lines, anchor, expectedText));
+      }
+
+      const candidateCounts = new Map<string, number>();
+      for (const candidate of candidateByKey.values()) {
+        if (candidate) candidateCounts.set(candidate.id, (candidateCounts.get(candidate.id) ?? 0) + 1);
+      }
+      const keyRemap = new Map<string, string>();
+      const nextAnchors = { ...draftAnchors.current };
+      const usedKeys = new Set<string>();
+      let conflictCount = 0;
+      for (const { lineId, anchor } of anchorsToReconcile) {
+        const candidate = candidateByKey.get(lineId) ?? null;
+        const canRebase = candidate !== null
+          && candidateCounts.get(candidate.id) === 1
+          && !usedKeys.has(candidate.id);
+        let nextKey: string;
+        let nextAnchor: DraftAnchor;
+        if (canRebase) {
+          nextKey = candidate!.id;
+          usedKeys.add(nextKey);
+          nextAnchor = {
+            ...anchor,
+            lineId: candidate!.id,
+            page: anchor.page,
+            pageId: candidate!.pageId,
+            revision: result.revision,
+            originalHash: candidate!.originalHash,
+            bbox: [...candidate!.bbox],
+            original: candidate!.text,
+            text: remaining[lineId] ?? submittedEdits[lineId] ?? anchor.text,
+          };
+        } else {
+          nextKey = `${ANCHOR_CONFLICT_PREFIX}${result.revision}:${lineId}`;
+          conflictCount += 1;
+          nextAnchor = { ...anchor, lineId: anchor.lineId || lineId, bbox: [...anchor.bbox] };
+        }
+        keyRemap.set(lineId, nextKey);
+        delete nextAnchors[lineId];
+        nextAnchors[nextKey] = nextAnchor;
+      }
+
+      const remapValues = (values: Record<string, string>): Record<string, string> => {
+        const mapped: Record<string, string> = {};
+        for (const [lineId, text] of Object.entries(values)) {
+          mapped[keyRemap.get(lineId) ?? lineId] = text;
+        }
+        return mapped;
+      };
+      const rebasedEdits = remapValues(remaining);
+      draftUndo.current = draftUndo.current.map(remapValues);
+      draftRedo.current = draftRedo.current.map(remapValues);
+      if (draftEditBurst.current) {
+        draftEditBurst.current = {
+          ...draftEditBurst.current,
+          lineId: keyRemap.get(draftEditBurst.current.lineId) ?? draftEditBurst.current.lineId,
+        };
+      }
+      draftAnchors.current = nextAnchors;
+      editsRef.current = rebasedEdits;
+      setEdits(rebasedEdits);
+      setDirty(Object.keys(rebasedEdits).length > 0);
+      setDraftHistoryVersion((value) => value + 1);
+
+      if (draftCacheEnabledRef.current && conflictCount === 0) void persistLocalDraft(true, false);
+      notify(conflictCount
+        ? `已提交 ${changed.length} 处修改；另有 ${conflictCount} 处草稿无法在新版本中唯一定位，已保留为冲突草稿`
+        : Object.keys(rebasedEdits).length
+          ? `已提交 ${changed.length} 处修改；保存期间的新修改仍保留，请再次保存`
+          : `已保存 ${changed.length} 处修改`);
+      return conflictCount === 0 && Object.keys(rebasedEdits).length === 0;
     } catch (err) {
       notify(await extractError(err));
       return false;
     } finally {
+      setReconcilingDraftAnchors(false);
       setSavingDraft(false);
       setBusy(false);
     }
-  }, [docId, applyResult, notify, persistLocalDraft, runEditorJob]);
+  }, [docId, applyResult, notify, persistLocalDraft, runEditorJob, updatePageModels]);
 
   const handleSaveAs = useCallback(async (): Promise<boolean> => {
     if (!docId) return false;
@@ -1566,6 +1722,27 @@ export function EditorPage() {
         </Alert>
       )}
 
+      {anchorConflictDrafts.length > 0 && (
+        <Alert color="orange" title="草稿定位冲突" w="100%">
+          <Stack gap="xs">
+            <Text size="sm">这些草稿无法在当前文档版本中唯一定位，已保留且不会自动写入。复制草稿内容后，可放弃冲突项并在正确文本行重新输入。</Text>
+            {anchorConflictDrafts.map(({ lineId, text, anchor }) => (
+              <Group key={lineId} justify="space-between" wrap="nowrap" align="flex-start">
+                <Stack gap={2} style={{ minWidth: 0, flex: 1 }}>
+                  <Text size="xs" c="dimmed">原目标：{anchor?.original ?? "无法确认"}</Text>
+                  <Text size="sm" data-testid="anchor-conflict-text" style={{ overflowWrap: "anywhere", userSelect: "text" }}>
+                    {text}
+                  </Text>
+                </Stack>
+                <Button size="xs" color="red" variant="light" onClick={() => discardAnchorConflict(lineId)}>
+                  放弃此冲突草稿
+                </Button>
+              </Group>
+            ))}
+          </Stack>
+        </Alert>
+      )}
+
       {jobProgress && (
         <Alert color="blue" title={jobProgress.state === "queued" ? "任务排队中" : "任务处理中"}>
           <Group justify="space-between">
@@ -1630,25 +1807,56 @@ export function EditorPage() {
               page={p}
               pageModel={pageModels[p.pageId]}
               busy={busy}
-              textEditLocked={busy && !savingDraft}
+              textEditLocked={busy && (!savingDraft || reconcilingDraftAnchors)}
               scale={scale}
               pdfDoc={pdfDoc}
               mode={mode}
-              edits={edits}
+              edits={visibleDrafts}
               findMatches={findMatches}
               moveSource={moveSource}
               addTextAt={addTextAt?.page === p.page ? addTextAt : null}
               onLineChange={(id, text) => {
-                if (busy && !savingDraft) return;
+                if (busy && (!savingDraft || reconcilingDraftAnchors)) return;
                 const line = allLines.find((candidate) => candidate.id === id);
-                if (line) {
+                if (!line) {
+                  notify("当前文本行尚未完成定位，草稿未写入");
+                  return;
+                }
+                const existingAnchor = draftAnchors.current[id];
+                if (existingAnchor && !isAnchorForCurrentLine(existingAnchor, line, revisionRef.current)) {
+                  const existingText = editsRef.current[id];
+                  if (existingText !== undefined) {
+                    const conflictId = `${ANCHOR_CONFLICT_PREFIX}${revisionRef.current}:${id}`;
+                    const moved = { ...editsRef.current };
+                    delete moved[id];
+                    moved[conflictId] = existingText;
+                    editsRef.current = moved;
+                    draftAnchors.current[conflictId] = existingAnchor;
+                    const remapHistory = (values: Record<string, string>) => {
+                      if (!Object.prototype.hasOwnProperty.call(values, id)) return values;
+                      const next = { ...values, [conflictId]: values[id]! };
+                      delete next[id];
+                      return next;
+                    };
+                    draftUndo.current = draftUndo.current.map(remapHistory);
+                    draftRedo.current = draftRedo.current.map(remapHistory);
+                    setEdits(moved);
+                    setDirty(true);
+                    setDraftHistoryVersion((value) => value + 1);
+                    notify("旧草稿锚点已转为冲突草稿，当前行已单独保留修改");
+                  }
+                  delete draftAnchors.current[id];
+                }
+                if (!draftAnchors.current[id]) {
                   draftAnchors.current[id] = {
                     lineId: id,
                     page: line.page,
+                    pageId: line.pageId,
+                    revision: revisionRef.current,
                     originalHash: line.originalHash,
                     bbox: [...line.bbox],
                     original: line.text,
-                    text,
+                    text: line.text,
                   };
                 }
                 recordDraftChange(id, text);

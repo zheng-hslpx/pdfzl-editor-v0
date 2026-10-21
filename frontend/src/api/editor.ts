@@ -31,6 +31,8 @@ export interface TextLine {
 
 export interface PageModel extends PageMeta {
   lines: TextLine[];
+  /** 此页面文本模型的提取版本，仅供前端缓存校验。 */
+  revision?: number;
 }
 
 export interface OpenResult {

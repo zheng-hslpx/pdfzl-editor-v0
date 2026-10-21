@@ -1,6 +1,9 @@
 export interface DraftAnchor {
   lineId: string;
   page: number;
+  /** 兼容引入版本化锚点之前写入的缓存记录。 */
+  pageId?: string;
+  revision?: number;
   originalHash: string;
   bbox: number[];
   original: string;
