@@ -72,6 +72,59 @@ def _display_textbox_to_page(page: fitz.Page, rect: fitz.Rect) -> fitz.Rect:
     )
 
 
+def _watermark_layout(
+    page: fitz.Page, text: str, font: str, font_size: float, angle: float
+) -> tuple[float, fitz.Rect, fitz.Point]:
+    """Scale a centered watermark so its rotated box fits the visible page."""
+    lines = text.splitlines() or [text]
+    line_width = max(
+        fitz.get_text_length(line, fontname=font, fontsize=font_size)
+        for line in lines
+    )
+    if line_width <= 0:
+        raise PdfError(422, "水印文字无法显示", code="WATERMARK_OVERFLOW")
+
+    line_height = font_size * 1.2
+    padding = font_size
+    box_width = line_width + 2 * padding
+    box_height = len(lines) * line_height + 2 * padding
+    radians = math.radians(angle)
+    cos_angle = abs(math.cos(radians))
+    sin_angle = abs(math.sin(radians))
+    rotated_width = cos_angle * box_width + sin_angle * box_height
+    rotated_height = sin_angle * box_width + cos_angle * box_height
+
+    visible = page.rect
+    margin = 8.0
+    available_width = visible.width - 2 * margin
+    available_height = visible.height - 2 * margin
+    scale = min(
+        1.0,
+        available_width / rotated_width,
+        available_height / rotated_height,
+    )
+    effective_size = font_size * scale
+    minimum_size = min(float(font_size), 8.0)
+    if scale <= 0 or effective_size < minimum_size - 1e-6:
+        raise PdfError(
+            422,
+            "水印文字过长或页面过小，无法在可读字号下完整显示",
+            code="WATERMARK_OVERFLOW",
+        )
+
+    scaled_width = line_width * scale
+    scaled_padding = padding * scale
+    scaled_height = len(lines) * line_height * scale
+    display_center = fitz.Point(visible.width / 2, visible.height / 2)
+    display_box = fitz.Rect(
+        display_center.x - scaled_width / 2 - scaled_padding,
+        display_center.y - scaled_height / 2 - scaled_padding,
+        display_center.x + scaled_width / 2 + scaled_padding,
+        display_center.y + scaled_height / 2 + scaled_padding,
+    )
+    return effective_size, display_box, display_center
+
+
 def _image_dpi(path: Path) -> tuple[float, float]:
     """Return embedded image DPI, with the common 96 DPI fallback."""
     try:
@@ -830,27 +883,21 @@ def _run_operation(operation: str, payload: dict[str, Any], work_dir: Path,
             indices = pdf_engine.parse_page_ranges(payload["pages"], doc.page_count)
             if operation == "misc_watermark":
                 text = payload["text"]
-                font_size = payload["fontSize"]
+                font_size = float(payload["fontSize"])
                 opacity = payload["opacity"]
                 angle = payload["rotation"]
                 color = _parse_color(payload["color"])
                 font = pdf_engine.pick_font(text)
-                width = fitz.get_text_length(text, fontname=font, fontsize=font_size)
                 for number, index in enumerate(indices, 1):
                     _check_cancel(cancel_event)
                     page = doc[index]
-                    rect = page.rect
-                    display_center = fitz.Point(rect.width / 2, rect.height / 2)
-                    display_box = fitz.Rect(
-                        display_center.x - width / 2 - 20,
-                        display_center.y - font_size,
-                        display_center.x + width / 2 + 20,
-                        display_center.y + font_size,
+                    effective_size, display_box, display_center = _watermark_layout(
+                        page, text, font, font_size, angle
                     )
                     center = _display_to_page_point(page, display_center)
                     box = _display_textbox_to_page(page, display_box)
                     inserted = page.insert_textbox(
-                        box, text, fontname=font, fontsize=font_size, color=color,
+                        box, text, fontname=font, fontsize=effective_size, color=color,
                         align=fitz.TEXT_ALIGN_CENTER, overlay=True,
                         fill_opacity=opacity,
                         morph=(center, fitz.Matrix(angle + page.rotation)),

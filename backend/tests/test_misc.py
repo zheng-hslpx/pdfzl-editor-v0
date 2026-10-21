@@ -1,12 +1,15 @@
 """Tests for /api/v1/misc/* endpoints."""
 from __future__ import annotations
 
+import math
+
 import fitz
 import pytest
+from PIL import Image
 
 from app.services.pdf_worker import _encryption_status
 
-from conftest import make_sample_pdf, successful_job
+from conftest import make_sample_pdf, submit_job, successful_job
 
 
 def _upload(name: str, path) -> tuple:
@@ -83,6 +86,101 @@ def test_watermark(client, sample_pdf):
     text = out[0].get_text()
     assert "内部资料" in text or "CONFIDENTIAL" in text
     out.close()
+
+
+def test_watermark_scales_to_fit_rotated_pages_and_renders_completely(client, tmp_path):
+    rotations = [0, 90, 180, 270]
+    sizes = [(612, 792), (792, 612), (400, 500), (180, 240)]
+    source_path = tmp_path / "watermark-rotations-and-sizes.pdf"
+    source = fitz.open()
+    for index, (rotation, size) in enumerate(zip(rotations, sizes)):
+        page = source.new_page(width=size[0], height=size[1])
+        page.insert_text((24, 40), f"SOURCE-{index + 1}", fontsize=10)
+        page.set_rotation(rotation)
+    source.set_metadata({"title": "Watermark layout regression"})
+    original_pages = [
+        (page.rotation, tuple(page.mediabox), tuple(page.cropbox))
+        for page in source
+    ]
+    source.save(source_path)
+    source.close()
+
+    _, response = successful_job(
+        client,
+        "/api/v1/misc/watermark",
+        files=[_upload(source_path.name, source_path)],
+        data={"text": "REVIEW COPY - INTERNAL", "fontSize": 48, "rotation": 35, "opacity": 0.3},
+    )
+    output_path = tmp_path / "watermarked-rotations-and-sizes.pdf"
+    output_path.write_bytes(response.content)
+    out = _open(response.content)
+
+    assert out.page_count == 4
+    assert out.metadata["title"] == "Watermark layout regression"
+    for index, page in enumerate(out):
+        assert (page.rotation, tuple(page.mediabox), tuple(page.cropbox)) == original_pages[index]
+        text = "".join(page.get_text().split())
+        assert "REVIEWCOPY-INTERNAL" in text
+        lines = [
+            line
+            for block in page.get_text("dict")["blocks"]
+            if block.get("type") == 0
+            for line in block["lines"]
+            if any("REVIEW" in span["text"] or "INTERNAL" in span["text"] for span in line["spans"])
+        ]
+        assert lines
+        display_bbox = fitz.Rect(lines[0]["bbox"]) * page.rotation_matrix
+        for line in lines[1:]:
+            display_bbox |= fitz.Rect(line["bbox"]) * page.rotation_matrix
+        assert page.rect.contains(display_bbox)
+        assert abs((display_bbox.x0 + display_bbox.x1) / 2 - page.rect.width / 2) < 40
+        assert abs((display_bbox.y0 + display_bbox.y1) / 2 - page.rect.height / 2) < 40
+
+        direction = fitz.Point(*lines[0]["dir"])
+        origin = fitz.Point(0, 0) * page.rotation_matrix
+        endpoint = direction * page.rotation_matrix
+        display_direction = (endpoint.x - origin.x, endpoint.y - origin.y)
+        assert abs(display_direction[0] - math.cos(math.radians(35))) < 0.05
+        assert abs(display_direction[1] + math.sin(math.radians(35))) < 0.05
+        sizes_found = [span["size"] for line in lines for span in line["spans"]]
+        assert sizes_found and min(sizes_found) >= 8
+
+        rendered = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        render_path = tmp_path / f"watermark-page-{index + 1}-rotation-{page.rotation}.png"
+        rendered.save(render_path)
+        assert rendered.width > 0 and rendered.height > 0
+        with Image.open(render_path) as rendered_image:
+            image = rendered_image.convert("RGB")
+        crop = image.crop((
+            max(0, math.floor(display_bbox.x0 * 2)),
+            max(0, math.floor(display_bbox.y0 * 2)),
+            min(image.width, math.ceil(display_bbox.x1 * 2)),
+            min(image.height, math.ceil(display_bbox.y1 * 2)),
+        ))
+        assert any(min(pixel) < 250 for pixel in crop.getdata())
+    out.close()
+
+
+def test_extremely_long_watermark_fails_instead_of_clipping(client, tmp_path):
+    source_path = tmp_path / "long-watermark-source.pdf"
+    source = fitz.open()
+    source.new_page(width=400, height=500)
+    source.save(source_path)
+    source.close()
+    original_bytes = source_path.read_bytes()
+
+    result, response = submit_job(
+        client,
+        "/api/v1/misc/watermark",
+        files=[_upload(source_path.name, source_path)],
+        data={"text": "AUDITLONG" * 30, "fontSize": 48, "rotation": 0},
+    )
+
+    assert result["state"] == "failed"
+    assert result["error"]["code"] == "WATERMARK_OVERFLOW"
+    assert "resultUrl" not in result
+    assert response is None
+    assert source_path.read_bytes() == original_bytes
 
 
 def test_watermark_empty_text(client, sample_pdf):
