@@ -2093,8 +2093,12 @@ function EditorCanvas(props: EditorCanvasProps) {
         {nearViewport && !rendered && <Text size="xs" c="dimmed">正在渲染第 {page.page + 1} 页…</Text>}
 
         {/* text overlays */}
-        <div style={{ pointerEvents: overlayPointerEvents }}>
-          {(pageModel?.lines ?? []).map((line) => {
+        <div
+          data-testid={`text-overlay-page-${page.page}`}
+          aria-hidden={page.rotation !== 0}
+          style={{ pointerEvents: overlayPointerEvents }}
+        >
+          {page.rotation === 0 ? (pageModel?.lines ?? []).map((line) => {
             const [x0, y0, x1, y1] = line.bbox;
             const value = edits[line.id] ?? line.text;
             const fontStyle = FONT_STYLES[line.font] ?? FONT_STYLES.helv!;
@@ -2129,7 +2133,7 @@ function EditorCanvas(props: EditorCanvasProps) {
                 }}
               />
             );
-          })}
+          }) : null}
         </div>
 
         {/* redaction drag preview */}
@@ -2158,9 +2162,15 @@ function EditorCanvas(props: EditorCanvasProps) {
           />
         )}
       </div>
-      <Text size="xs" c="dimmed" ta="center" mt={4}>
+      <Text
+        size="xs"
+        c="dimmed"
+        ta="center"
+        mt={4}
+        data-testid={page.rotation !== 0 ? `rotation-notice-${page.page}` : undefined}
+      >
         第 {page.page + 1} 页
-        {page.rotation !== 0 && "（已旋转，坐标编辑已禁用）"}
+        {page.rotation !== 0 && "（旋转页文字覆盖层已隐藏；坐标编辑已禁用）"}
         {previewLimited && "（已降低预览分辨率）"}
       </Text>
     </div>

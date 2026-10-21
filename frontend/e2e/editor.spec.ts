@@ -8,12 +8,14 @@ let fixtureDirectory = "";
 let fixturePath = "";
 let raceFixturePath = "";
 let imageFixturePath = "";
+let rotatedFixturePath = "";
 
 test.beforeAll(() => {
   fixtureDirectory = mkdtempSync(join(tmpdir(), "pdfed-e2e-"));
   fixturePath = join(fixtureDirectory, "editor-smoke.pdf");
   raceFixturePath = join(fixtureDirectory, "editor-race.pdf");
   imageFixturePath = join(fixtureDirectory, "conversion-image.png");
+  rotatedFixturePath = join(fixtureDirectory, "editor-rotations.pdf");
   const python = process.env.PYTHON ?? (process.platform === "win32" ? "python" : "python3");
   const source = [
     "import fitz, sys",
@@ -33,10 +35,18 @@ test.beforeAll(() => {
     "race_page.insert_text((40, 110), 'PAGE1 SECOND ORIGINAL', fontsize=14)",
     "race.save(sys.argv[2])",
     "race.close()",
+    "rotated = fitz.open()",
+    "for angle in (0, 90, 180, 270):",
+    "    page = rotated.new_page(width=420, height=600)",
+    "    page.insert_text((48, 90), f'ROTATION-{angle}-CANVAS', fontsize=18)",
+    "    page.draw_rect(fitz.Rect(48, 110, 180, 160), color=(1, 0, 0), fill=(1, 0, 0))",
+    "    page.set_rotation(angle)",
+    "rotated.save(sys.argv[4])",
+    "rotated.close()",
     "from PIL import Image",
     "Image.new('RGB', (120, 80), (30, 90, 150)).save(sys.argv[3])",
-  ].join("; ");
-  execFileSync(python, ["-c", source, fixturePath, raceFixturePath, imageFixturePath], { stdio: "pipe" });
+  ].join("\n");
+  execFileSync(python, ["-c", source, fixturePath, raceFixturePath, imageFixturePath, rotatedFixturePath], { stdio: "pipe" });
 });
 
 test.afterAll(() => {
@@ -346,6 +356,97 @@ test("uses actual conversion output types for PDF, DOCX, ZIP, image, and text re
   await convert("图片 → PDF", imageFixturePath);
   await expect(page.getByRole("button", { name: "在编辑器中打开" })).toBeVisible();
   await expect(page.locator("canvas").first()).toBeVisible();
+});
+
+test("hides untrusted text overlays on rotated pages while rendering each page rotation", async ({ page }) => {
+  page.setDefaultTimeout(10_000);
+  const loadedTextPages = new Set<number>();
+  page.on("response", (response) => {
+    const match = /\/pages\/(\d+)\/text$/.exec(new URL(response.url()).pathname);
+    if (match) loadedTextPages.add(Number(match[1]));
+  });
+
+  await page.goto("/editor");
+  const pdfRequest = page.waitForRequest(
+    (request) => /\/api\/v1\/edit\/[^/]+\/download(?:\?|$)/.test(request.url()),
+    { timeout: 30_000 },
+  );
+  await page.locator('input[type="file"][accept=".pdf,application/pdf"]').setInputFiles(rotatedFixturePath);
+  const request = await pdfRequest;
+  const match = /\/api\/v1\/edit\/([^/]+)\/download/.exec(new URL(request.url()).pathname);
+  if (!match) throw new Error("Rotated PDF preview request did not include a docId");
+  const docId = match[1]!;
+  await expect(page.getByText("editor-rotations.pdf", { exact: true })).toBeVisible();
+
+  const pagesResponse = await page.request.get(`http://127.0.0.1:8000/api/v1/edit/${docId}/pages?offset=0&limit=10`);
+  expect(pagesResponse.status()).toBe(200);
+  const metadata = await pagesResponse.json() as { revision: number; pages: Array<{ page: number; pageId: string; rotation: number }> };
+  expect(metadata.pages.map((item) => item.rotation)).toEqual([0, 90, 180, 270]);
+
+  for (const [pageNo, rotation] of [0, 90, 180, 270].entries()) {
+    const textResponse = await page.request.get(`http://127.0.0.1:8000/api/v1/edit/${docId}/pages/${pageNo}/text`);
+    expect(textResponse.status()).toBe(200);
+    const model = await textResponse.json() as { page: { lines: Array<{ text: string; bbox: number[] }> } };
+    const line = model.page.lines.find((item) => item.text === `ROTATION-${rotation}-CANVAS`);
+    expect(line).toBeDefined();
+
+    await page.evaluate((index) => {
+      const maxScroll = document.documentElement.scrollHeight - window.innerHeight;
+      window.scrollTo(0, Math.max(0, maxScroll * index / 3));
+    }, pageNo);
+    const pageFrame = page.locator(`[data-page-number="${pageNo}"]`);
+    await pageFrame.scrollIntoViewIfNeeded();
+    const canvas = pageFrame.locator("canvas");
+    await expect(canvas).toBeVisible();
+    await expect.poll(() => canvas.evaluate((element) => (element as HTMLCanvasElement).width)).toBeGreaterThan(0);
+    await expect.poll(() => canvas.evaluate((element) => (element as HTMLCanvasElement).height)).toBeGreaterThan(0);
+    await expect.poll(() => loadedTextPages.has(pageNo)).toBe(true);
+
+    const image = await canvas.evaluate((element) => {
+      const canvas = element as HTMLCanvasElement;
+      const context = canvas.getContext("2d");
+      if (!context) return { width: canvas.width, height: canvas.height, nonWhitePixels: 0 };
+      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+      let nonWhitePixels = 0;
+      for (let index = 0; index < pixels.length; index += 4) {
+        if (pixels[index] !== 255 || pixels[index + 1] !== 255 || pixels[index + 2] !== 255) nonWhitePixels += 1;
+      }
+      return { width: canvas.width, height: canvas.height, nonWhitePixels };
+    });
+    expect(image.nonWhitePixels).toBeGreaterThan(0);
+    expect(image.width > image.height).toBe(rotation === 90 || rotation === 270);
+    await pageFrame.screenshot({ path: `test-results/f08-page-${rotation}.png` });
+
+    const overlays = pageFrame.locator("textarea");
+    if (rotation === 0) {
+      await expect(overlays).toHaveCount(1);
+      await expect(overlays.first()).toHaveValue("ROTATION-0-CANVAS");
+      const frameBox = await pageFrame.boundingBox();
+      const overlayBox = await overlays.first().boundingBox();
+      expect(frameBox).not.toBeNull();
+      expect(overlayBox).not.toBeNull();
+      expect(Math.abs(overlayBox!.x - (frameBox!.x + line!.bbox[0]! * 1.2))).toBeLessThan(2);
+      expect(Math.abs(overlayBox!.y - (frameBox!.y + line!.bbox[1]! * 1.2))).toBeLessThan(2);
+    } else {
+      await expect(overlays).toHaveCount(0);
+      await expect(page.getByTestId(`rotation-notice-${pageNo}`)).toContainText("文字覆盖层已隐藏");
+    }
+  }
+
+  const rotatedPage = metadata.pages[1]!;
+  const rejectedWrite = await page.request.post(`http://127.0.0.1:8000/api/v1/edit/${docId}/text/add`, {
+    data: {
+      expectedRevision: metadata.revision,
+      page: rotatedPage.page,
+      pageId: rotatedPage.pageId,
+      x: 48,
+      y: 180,
+      text: "MUST NOT BE WRITTEN",
+    },
+    headers: { "Idempotency-Key": `rotated-overlay-${Date.now()}` },
+  });
+  expect(rejectedWrite.status()).toBe(422);
+  expect((await rejectedWrite.json()).code).toBe("ROTATED_PAGE_UNSUPPORTED");
 });
 
 test("launcher default origin loads the editor and accepts a PDF upload", async ({ page }) => {

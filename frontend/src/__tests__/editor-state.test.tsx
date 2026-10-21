@@ -100,15 +100,21 @@ function renderEditor(initialEntries = ["/editor"]) {
   return { ...result, router };
 }
 
-async function openSample(container: HTMLElement) {
+async function openSample(container: HTMLElement, expectTextOverlay = true) {
   const input = container.querySelector<HTMLInputElement>('input[accept=".pdf,application/pdf"]');
   expect(input).toBeDefined();
   fireEvent.change(input!, {
     target: { files: [new File(["pdf"], "sample.pdf", { type: "application/pdf" })] },
   });
-  await waitFor(() => expect(container.querySelector("textarea")).not.toBeNull());
+  if (expectTextOverlay) {
+    await waitFor(() => expect(container.querySelector("textarea")).not.toBeNull());
+  } else {
+    await waitFor(() => expect(container.querySelector('[data-testid="rotation-notice-0"]')).not.toBeNull());
+  }
   await waitFor(() => expect(mocks.fetchPageText).toHaveBeenCalled());
+  if (expectTextOverlay) {
     expect(window.getComputedStyle(container.querySelector("textarea")!).backgroundColor).toBe("rgb(255, 255, 255)");
+  }
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
@@ -464,7 +470,7 @@ describe("editor dirty-draft protection", () => {
     expect(container.querySelectorAll("[data-page-number]").length).toBeLessThan(10);
   });
 
-  it.each([90, 180, 270])("disables coordinate editing on %i-degree pages", async (rotation) => {
+  it.each([90, 180, 270])("hides text overlays and disables coordinate editing on %i-degree pages", async (rotation) => {
     const rotatedPage = { ...page, rotation };
     mocks.openEditor.mockResolvedValue({
       docId: "session-1",
@@ -475,7 +481,9 @@ describe("editor dirty-draft protection", () => {
       textModel: [rotatedPage],
     });
     const { container } = renderEditor();
-    await openSample(container);
+    await openSample(container, false);
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(screen.getByTestId("rotation-notice-0").textContent).toContain("文字覆盖层已隐藏");
     const pageSurface = container.querySelector("canvas")?.parentElement;
     expect(pageSurface).toBeDefined();
 
