@@ -287,6 +287,7 @@ class JobManager:
         *,
         session_id: str | None = None,
         expected_revision: int | None = None,
+        queue_wait_seconds: float = 0,
     ) -> dict[str, Any]:
         """Run a bounded worker operation and return its JSON result directly.
 
@@ -297,15 +298,26 @@ class JobManager:
         key = uuid.uuid4().hex
         scope = f"internal:{key}"
         request_hash = self.fingerprint(operation, payload, [])
-        job = await self.submit(
-            operation,
-            payload,
-            idempotency_key=key,
-            request_hash=request_hash,
-            session_id=session_id,
-            expected_revision=expected_revision,
-            idempotency_scope=scope,
-        )
+        deadline = asyncio.get_running_loop().time() + max(0.0, queue_wait_seconds)
+        while True:
+            try:
+                job = await self.submit(
+                    operation,
+                    payload,
+                    idempotency_key=key,
+                    request_hash=request_hash,
+                    session_id=session_id,
+                    expected_revision=expected_revision,
+                    idempotency_scope=scope,
+                )
+                break
+            except PdfError as exc:
+                if exc.code != "JOB_QUEUE_FULL" or queue_wait_seconds <= 0:
+                    raise
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise
+                await asyncio.sleep(min(0.05, remaining))
         try:
             assert job.done_event is not None
             while not job.done_event.is_set():

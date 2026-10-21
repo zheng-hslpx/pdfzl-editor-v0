@@ -84,6 +84,45 @@ def test_internal_worker_cancellation_terminates_process():
     asyncio.run(scenario())
 
 
+def test_internal_worker_waits_for_a_bounded_queue_slot():
+    async def scenario():
+        manager = JobManager()
+        await manager.start()
+        try:
+            blocker = await manager.submit(
+                "test_sleep",
+                {"seconds": 0.4},
+                idempotency_key="queue-wait-blocker",
+                request_hash="queue-wait-blocker",
+            )
+            deadline = asyncio.get_running_loop().time() + 5
+            while manager._active_id != blocker.id and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
+            assert manager._active_id == blocker.id
+
+            queued = await manager.submit(
+                "test_sleep",
+                {"seconds": 0.1},
+                idempotency_key="queue-wait-pending",
+                request_hash="queue-wait-pending",
+            )
+            assert manager._queue is not None and manager._queue.full()
+
+            started = asyncio.get_running_loop().time()
+            result = await manager.run_internal(
+                "test_sleep", {"seconds": 0.01}, queue_wait_seconds=2
+            )
+            elapsed = asyncio.get_running_loop().time() - started
+            assert result == {"slept": 0.01}
+            assert elapsed >= 0.35
+            assert blocker.state == "succeeded"
+            assert queued.state == "succeeded"
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("state", ["queued", "running", "succeeded", "failed", "cancelled"])
 def test_idempotent_retry_resolves_existing_job_before_preflight(state, tmp_path):
     manager = JobManager()

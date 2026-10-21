@@ -201,6 +201,7 @@ async def save_upload(upload, suffix: str = ".pdf", *, allow_encrypted: bool = F
                     "source_path": str(dest),
                     "allow_encrypted": allow_encrypted,
                 },
+                queue_wait_seconds=5,
             )
             page_count = validation.get("pageCount")
             if page_count is not None:
