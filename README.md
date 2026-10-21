@@ -2,7 +2,7 @@
 
 本机运行的单用户 PDF 工具。文档在本机处理；后端与 Vite 默认只监听 `127.0.0.1`。服务没有登录鉴权；请勿绑定到局域网或公网地址。项目按本机处理设计，但尚未完成全量运行时网络外呼审计。
 
-v0.2 的 F01–F13 整改和本机回归已通过，当前进入正式验收判断。**这不代表正式验收或发布已完成**：LibreOffice 强制终止后的外部临时目录清理仍有边界未验证；公开分发前还需项目所有者决定 PyMuPDF 许可路径。产品范围不含 OCR、表单、批注或真正的安全 redaction。当前工具注册表有 **11 个入口**；“格式转换”入口内含 5 种转换。
+截至 2026-10-21，F01–F13 和四项最终验收补充整改已完成，本机规定的 pytest、Vitest、TypeScript、production build 及开发/production E2E 均通过。**建议 PDF Editor v0.2 通过个人离线自用正式验收**；本地未打 tag 或发布。LibreOffice 强制终止后的外部临时目录清理、极端 PDF 与资源压力尚未穷尽验证。PyMuPDF 许可路线是未来公开分发前的所有者决策，不是个人离线自用验收阻断项。产品范围不含 OCR、表单、批注或真正的安全 redaction。当前工具注册表有 **11 个入口**；“格式转换”入口内含 5 种转换。
 
 ## 功能
 
@@ -86,13 +86,13 @@ Playwright 配置会启动本地后端和 Vite。可通过 `PYTHON` 指定启动
 
 ### 本机 v0.2 整改回归记录（2026-10-21）
 
-- 后端锁定环境：pytest **111 passed，0 skipped**；包含 F10–F13 回归和本机 LibreOffice Office→PDF 成功路径。收到一条既有 Starlette/httpx 弃用提示。
-- 前端：TypeScript 检查通过，Vitest **47/47**，Vite production build 成功。
-- Playwright Chromium 开发模式 **14/14**、Production preview 模式 **14/14**；E2E 导航断言使用当前配置 origin，因此 preview 全套均访问 `4173` 上的实际应用。
-- LibreOffice readiness 使用独立临时 profile 实测冷启动转换 **13.08 秒**；新后端实例通过真实 `/api/health/ready` 请求从 `unknown/checking` 到 `ready`，耗时 **13.15 秒**。超时回归验证会保留 `unknown` 并冷却重试，不误报 `not_ready`。
-- Axios 提示回归覆盖结构化业务错误（JSON/Blob）、无响应网络故障、取消、已知服务端操作错误和 `INTERNAL_ERROR`，并区分提示。
+- 后端锁定环境：pytest **115 passed，0 skipped**；包含 F01/F02 相关服务端回归、长文字溢出 API 与真实 PDF 输出、F10–F13 回归及 Office→PDF 成功路径。收到一条既有 Starlette/httpx 弃用提示。
+- 前端：TypeScript 检查通过，Vitest **54/54**，Vite production build 成功。
+- Playwright Chromium 开发模式 **16/16**、Production preview 模式 **16/16**。包含 F01 双 save-race、草稿恢复、新增长文字溢出真实浏览器流程、transient 503 后预览重试及 StrictMode 文件切换/卸载；preview 全套访问 `4173` 的 production preview。
+- PDF.js 静态资源检查通过：锁定及安装版本均为 `6.4.299`；169 个 CMap 目录文件和 16 个 standard-font 目录文件（均包含相应许可文件）逐文件 SHA-256 一致。篡改资源的临时故障夹具被脚本拒绝。
+- 预览打开有可取消的 60 秒截止；Vitest 故障注入验证打开超时、render rejection、重试、卸载和 `loadingTask.destroy()` 后释放 Blob URL。真实浏览器 transient 503 后重试读取并渲染真实 PDF 成功。
 - Vite build 仍有 `EditorPage.tsx` 动态/静态导入提示和大于 500 kB 的 chunk 提示；不影响 build 成功。
-- 本次未重跑 `pip-audit`、`npm audit`、CycloneDX 或托管 CI。GitHub Actions 尚未触发；这些结果不能记作本次通过。
+- 本次未运行 `pip-audit`、`npm audit`、CycloneDX 或托管 CI，也未 push；这些结果不能记作本次通过。
 
 ## 已知限制
 
@@ -102,9 +102,11 @@ Playwright 配置会启动本地后端和 Vite。可通过 `PYTHON` 指定启动
 4. PDF 对象优化不做图像降采样，文件变小的幅度取决于具体文档。
 5. 浏览器本地恢复缓存未加密；不要对敏感文件开启。超过 7 天的记录在下次列出草稿时删除，不提供浏览器关闭期间的定时物理擦除保证。
 6. LibreOffice 进程树有 Windows Job Object 管理；强制终止发生在外部转换的不同阶段时，所有 profile/临时目录清理路径尚未逐一验证。
-7. 本次未对运行时所有网络外呼做全流量审计，也未运行托管 GitHub Actions；本机检查不能替代这些证据。
-8. 安装依赖时需要访问 Python/npm 软件源；安装完成后，PDF 处理不依赖云服务。
+7. 极端字体、非标准页面 box/UserUnit、签名/表单保真、600 MiB 文件、15 分钟任务及长期磁盘压力未做穷尽验证；不声称任意 PDF 的格式保真。
+8. PDF 打开过程有 60 秒截止并支持重试；每页 render 抛错时可单页重试。单页 render promise 永久 pending 没有独立的页面级截止时间。
+9. 本次未对运行时所有网络外呼做全流量审计，也未运行托管 GitHub Actions；本机检查不能替代这些证据。
+10. 安装依赖时需要访问 Python/npm 软件源；安装完成后，PDF 处理不依赖云服务。
 
 ## 许可证
 
-仓库根目录 `LICENSE` 保持原样。第三方依赖许可和 PyMuPDF 双许可说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。PyMuPDF 可按 AGPL-3.0 或 Artifex 商业许可使用；项目所有者尚需选择适用路径并记录决定。公开分发前应完成该决定及对应许可检查。
+仓库根目录 `LICENSE` 保持原样。第三方依赖许可和 PyMuPDF 双许可说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。个人离线自用验收不要求先完成公开分发许可选择；若未来公开分发，项目所有者须先选择并记录 AGPL-3.0 或 Artifex 商业许可路径，再完成对应检查。
