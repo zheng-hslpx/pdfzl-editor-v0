@@ -130,9 +130,8 @@ def _page_meta(doc: fitz.Document, page_ids: list[str] | None = None) -> list[di
     ]
 
 
-def _load_session_pdf(doc_id: str) -> fitz.Document:
-    session = session_manager.get(doc_id)
-    return pdf_engine.open_pdf(session.path)
+def _accepted(job) -> JSONResponse:
+    return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
 
 
 def _check_revision(session, expected_revision: int) -> None:
@@ -146,69 +145,10 @@ def _check_revision(session, expected_revision: int) -> None:
         )
 
 
-def _check_page(session, page_no: int, page_id: str, doc: fitz.Document) -> fitz.Page:
-    if page_no < 0 or page_no >= doc.page_count:
-        raise PdfError(400, f"页码越界: {page_no}")
-    if page_no >= len(session.page_ids) or session.page_ids[page_no] != page_id:
-        raise PdfError(409, "页面身份已变化，请重新定位操作", code="REVISION_CONFLICT")
-    page = doc[page_no]
-    if page.rotation != 0:
-        raise PdfError(
-            422,
-            "旋转页暂不支持坐标编辑，请先用旋转工具归一化",
-            code="ROTATED_PAGE_UNSUPPORTED",
-        )
-    return page
-
-
-def _check_line_anchor(session, doc: fitz.Document, edit) -> None:
-    page = _check_page(session, edit.page, edit.pageId or "", doc)
-    if edit.kind == "cover":
-        return
-    page_model = extract_page_text_model(doc, edit.page, edit.pageId or "")
-    line = next((item for item in page_model["lines"] if item["id"] == edit.lineId), None)
-    if (
-        line is None
-        or line["originalHash"] != edit.originalHash
-        or line["text"] != edit.original
-        or any(abs(float(a) - float(b)) > 0.5 for a, b in zip(line["bbox"], edit.bbox))
-    ):
-        raise PdfError(409, "文本行已变化，请重新定位草稿", code="REVISION_CONFLICT")
-
-
 def _ensure_session_writable(session, expected_revision: int) -> None:
     _check_revision(session, expected_revision)
     if session.pending_job_id is not None:
         raise PdfError(409, "文档修改任务仍在执行", code="SESSION_BUSY")
-
-
-def _preflight_page_write(
-    session, expected_revision: int, page_no: int, page_id: str,
-    rect: fitz.Rect | None = None,
-) -> None:
-    """Keep stale revision, page identity, and rotation errors as HTTP 4xx."""
-    with session.lock:
-        _ensure_session_writable(session, expected_revision)
-        doc = _load_session_pdf(session.id)
-        try:
-            page = _check_page(session, page_no, page_id, doc)
-            if rect is not None and not page.rect.contains(rect):
-                raise PdfError(422, "编辑区域超出页面范围", code="INVALID_BBOX")
-        finally:
-            doc.close()
-
-
-def _preflight_edits(session, payload: ApplyEditsRequest) -> None:
-    with session.lock:
-        _ensure_session_writable(session, payload.expectedRevision)
-        doc = _load_session_pdf(session.id)
-        try:
-            for edit in payload.edits:
-                _check_line_anchor(session, doc, edit)
-                if not doc[edit.page].rect.contains(fitz.Rect(edit.bbox)):
-                    raise PdfError(422, "编辑区域超出页面范围", code="INVALID_BBOX")
-        finally:
-            doc.close()
 
 
 @router.get("/{doc_id}/pages", summary="分页读取页面信息")
@@ -242,14 +182,30 @@ async def get_page_text(doc_id: str, page_no: int):
             raise PdfError(409, "文档修改任务仍在执行", code="SESSION_BUSY")
         if page_no < 0 or page_no >= len(session.page_ids):
             raise PdfError(404, "页面不存在")
-        doc = pdf_engine.open_pdf(session.path)
-        try:
-            page = extract_page_text_model(
-                doc, page_no, session.page_ids[page_no]
-            )
-        finally:
-            doc.close()
-        return {"docId": doc_id, "revision": session.revision, "page": page}
+        revision = session.revision
+        page_id = session.page_ids[page_no]
+        source_path = session.path
+        session.active_text_reads += 1
+    try:
+        result = await job_manager.run_internal(
+            "editor_page_text",
+            {"source_path": str(source_path), "page": page_no, "page_id": page_id},
+        )
+        with session.lock:
+            if session.closed:
+                raise PdfError(404, "编辑会话不存在或已过期，请重新打开文件")
+            if session.revision != revision:
+                raise PdfError(
+                    409,
+                    "文档已被其他操作修改，请刷新页面后重新定位草稿",
+                    code="REVISION_CONFLICT",
+                )
+            if session.pending_job_id is not None:
+                raise PdfError(409, "文档修改任务仍在执行", code="SESSION_BUSY")
+        return {"docId": doc_id, "revision": revision, "page": result["page"]}
+    finally:
+        with session.lock:
+            session.active_text_reads = max(0, session.active_text_reads - 1)
 
 
 @router.get("/{doc_id}/history", summary="查询撤销/重做状态")
@@ -441,6 +397,21 @@ async def apply_edits(
         {**payload_dict, "docId": doc_id, "historyPolicy": history_policy or None},
         [],
     )
+    existing = job_manager.find_existing(
+        idempotency_key, request_hash, session_id=doc_id
+    )
+    if existing is not None:
+        return _accepted(existing)
+    await job_manager.run_internal(
+        "editor_preflight_edits",
+        {
+            "source_path": str(session.path),
+            "page_ids": list(session.page_ids),
+            "edits": payload_dict["edits"],
+        },
+        session_id=doc_id,
+        expected_revision=payload.expectedRevision,
+    )
     job = await job_manager.submit(
         "editor_apply",
         payload_dict,
@@ -449,9 +420,8 @@ async def apply_edits(
         session_id=doc_id,
         expected_revision=payload.expectedRevision,
         history_policy=history_policy or None,
-        preflight=lambda: _preflight_edits(session, payload),
     )
-    return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
+    return _accepted(job)
 
 
 @router.post("/{doc_id}/text/add", summary="添加文字")
@@ -469,6 +439,23 @@ async def add_text(
         {**payload_dict, "docId": doc_id, "historyPolicy": history_policy or None},
         [],
     )
+    existing = job_manager.find_existing(
+        idempotency_key, request_hash, session_id=doc_id
+    )
+    if existing is not None:
+        return _accepted(existing)
+    await job_manager.run_internal(
+        "editor_preflight_page_write",
+        {
+            "source_path": str(session.path),
+            "page_ids": list(session.page_ids),
+            "page": payload.page,
+            "page_id": payload.pageId,
+            "rect": [payload.x, payload.y, payload.x + 1, payload.y + 1],
+        },
+        session_id=doc_id,
+        expected_revision=payload.expectedRevision,
+    )
     job = await job_manager.submit(
         "editor_add_text",
         payload_dict,
@@ -477,12 +464,8 @@ async def add_text(
         session_id=doc_id,
         expected_revision=payload.expectedRevision,
         history_policy=history_policy or None,
-        preflight=lambda: _preflight_page_write(
-            session, payload.expectedRevision, payload.page, payload.pageId,
-            fitz.Rect(payload.x, payload.y, payload.x + 1, payload.y + 1),
-        ),
     )
-    return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
+    return _accepted(job)
 
 
 @router.post("/{doc_id}/image/add", summary="添加图片/印章")
@@ -526,6 +509,24 @@ async def add_image(
             },
             [temp_manager.get_digest(img_path)],
         )
+        existing = job_manager.find_existing(
+            idempotency_key, request_hash, session_id=doc_id
+        )
+        if existing is not None:
+            temp_manager.discard(img_path)
+            return _accepted(existing)
+        await job_manager.run_internal(
+            "editor_preflight_page_write",
+            {
+                "source_path": str(session.path),
+                "page_ids": list(session.page_ids),
+                "page": page,
+                "page_id": pageId,
+                "rect": [x, y, x + w, y + h],
+            },
+            session_id=doc_id,
+            expected_revision=expectedRevision,
+        )
         job = await job_manager.submit(
             "editor_add_image",
             payload,
@@ -535,11 +536,8 @@ async def add_image(
             session_id=doc_id,
             expected_revision=expectedRevision,
             history_policy=history_policy or None,
-            preflight=lambda: _preflight_page_write(
-                session, expectedRevision, page, pageId, fitz.Rect(x, y, x + w, y + h)
-            ),
         )
-        return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
+        return _accepted(job)
     except BaseException:
         temp_manager.discard(img_path)
         raise
@@ -648,6 +646,8 @@ async def close_session(doc_id: str):
         with session.lock:
             if session.pending_job_id is not None:
                 raise PdfError(409, "文档修改任务仍在执行，请先等待或取消任务", code="SESSION_BUSY")
+            if session.active_text_reads:
+                raise PdfError(409, "单页文本读取仍在执行，请稍后关闭", code="SESSION_BUSY")
             session_manager.close(doc_id)
     return {"ok": True}
 

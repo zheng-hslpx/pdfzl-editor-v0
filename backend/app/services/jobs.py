@@ -255,6 +255,71 @@ class JobManager:
         self._idempotency[idem_index] = (request_hash, job_id, time.time())
         return job
 
+    async def run_internal(
+        self,
+        operation: str,
+        payload: dict[str, Any],
+        *,
+        session_id: str | None = None,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Run a bounded worker operation and return its JSON result directly.
+
+        Internal reads and preflights share the normal single-worker queue,
+        process memory limit, wall-clock timeout, and cancellation cleanup.
+        Their temporary job records are removed as soon as the caller resumes.
+        """
+        key = uuid.uuid4().hex
+        scope = f"internal:{key}"
+        request_hash = self.fingerprint(operation, payload, [])
+        job = await self.submit(
+            operation,
+            payload,
+            idempotency_key=key,
+            request_hash=request_hash,
+            session_id=session_id,
+            expected_revision=expected_revision,
+            idempotency_scope=scope,
+        )
+        try:
+            assert job.done_event is not None
+            while not job.done_event.is_set():
+                try:
+                    await asyncio.wait_for(job.done_event.wait(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    pass
+            if job.state == "succeeded":
+                return job.result or {}
+            error = job.error or {"code": "WORKER_FAILED", "message": "PDF 处理任务失败"}
+            code = error.get("code", "WORKER_FAILED")
+            status = {
+                "INVALID_INPUT": 400,
+                "INVALID_PDF": 400,
+                "ENCRYPTED_PDF": 400,
+                "NOT_FOUND": 404,
+                "INVALID_BBOX": 422,
+                "ROTATED_PAGE_UNSUPPORTED": 422,
+                "REVISION_CONFLICT": 409,
+                "SESSION_BUSY": 409,
+                "CANCELLED": 499,
+                "JOB_TIMEOUT": 504,
+                "MEMORY_BUDGET_EXCEEDED": 503,
+                "WORKER_FAILED": 500,
+            }.get(code, 500)
+            raise PdfError(status, error.get("message", "PDF 处理任务失败"), code=code)
+        except asyncio.CancelledError:
+            if job.state not in _TERMINAL:
+                try:
+                    await asyncio.shield(self.cancel(job.id))
+                except Exception:
+                    logger.exception("Could not cancel internal PDF operation %s", job.id)
+            raise
+        finally:
+            if job.state in _TERMINAL:
+                self._records.pop(job.id, None)
+                self._idempotency.pop((scope, key), None)
+                shutil.rmtree(job.work_dir, ignore_errors=True)
+
     def find_existing(
         self,
         idempotency_key: str,
@@ -761,6 +826,8 @@ class JobManager:
                     if not session.closed:
                         data = job.result or {}
                         session.page_metadata = list(data.pop("_allPageMetadata", data.get("pages", [])))
+            else:
+                self._release_session(job)
             self._finish(job, "succeeded")
             return
 

@@ -279,6 +279,12 @@ def _run_operation(operation: str, payload: dict[str, Any], work_dir: Path,
         for offset in range(0, amount, 1024 * 1024):
             buffer[offset] = 1
         return {"kind": "json", "data": {"allocated": len(buffer)}}
+    if operation == "validate_pdf":
+        page_count = validate_pdf(
+            Path(payload["source_path"]),
+            allow_encrypted=bool(payload.get("allow_encrypted", False)),
+        )
+        return {"kind": "json", "data": {"pageCount": page_count}}
     if operation == "test_session_mutation":
         duration = max(0.0, float(payload.get("seconds", 0)))
         deadline = __import__("time").monotonic() + duration
@@ -308,6 +314,56 @@ def _run_operation(operation: str, payload: dict[str, Any], work_dir: Path,
                     "_allPageMetadata": page_metadata,
                 },
             }
+        finally:
+            doc.close()
+
+    if operation == "editor_page_text":
+        doc = _read_pdf(payload["source_path"])
+        try:
+            page_no = int(payload["page"])
+            if not 0 <= page_no < doc.page_count:
+                raise PdfError(404, "页面不存在")
+            from ..routers.edit import extract_page_text_model
+
+            page = extract_page_text_model(doc, page_no, payload["page_id"])
+            return {"kind": "json", "data": {"page": page}}
+        finally:
+            doc.close()
+
+    if operation == "editor_preflight_edits":
+        doc = _read_pdf(payload["source_path"])
+        try:
+            page_text_models: dict[int, dict] = {}
+            for edit in payload["edits"]:
+                page = _validate_anchor(
+                    doc, payload["page_ids"], edit, page_text_models
+                )
+                if not page.rect.contains(fitz.Rect(edit["bbox"])):
+                    raise PdfError(422, "编辑区域超出页面范围", code="INVALID_BBOX")
+            return {"kind": "json", "data": {"ok": True}}
+        finally:
+            doc.close()
+
+    if operation == "editor_preflight_page_write":
+        doc = _read_pdf(payload["source_path"])
+        try:
+            page_no = int(payload["page"])
+            page_ids = payload["page_ids"]
+            if page_no < 0 or page_no >= doc.page_count:
+                raise PdfError(400, f"页码越界: {page_no}")
+            if page_no >= len(page_ids) or page_ids[page_no] != payload["page_id"]:
+                raise PdfError(409, "页面身份已变化，请重新定位操作", code="REVISION_CONFLICT")
+            page = doc[page_no]
+            if page.rotation != 0:
+                raise PdfError(
+                    422,
+                    "旋转页暂不支持坐标编辑，请先用旋转工具归一化",
+                    code="ROTATED_PAGE_UNSUPPORTED",
+                )
+            rect = payload.get("rect")
+            if rect is not None and not page.rect.contains(fitz.Rect(rect)):
+                raise PdfError(422, "编辑区域超出页面范围", code="INVALID_BBOX")
+            return {"kind": "json", "data": {"ok": True}}
         finally:
             doc.close()
 

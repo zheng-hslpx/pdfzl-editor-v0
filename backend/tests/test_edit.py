@@ -1,8 +1,11 @@
 """Tests for the visual editor endpoints (/api/v1/edit/*)."""
 from __future__ import annotations
 
+import gzip
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import fitz
 import pytest
@@ -74,6 +77,38 @@ def test_open_returns_light_pages_and_paged_text_api(client, sample_pdf):
     assert line["bbox"][2] > line["bbox"][0]
     assert line["fontSize"] > 0
     assert line["font"] == "helv"
+
+
+def test_dense_page_text_worker_keeps_health_responsive(client):
+    source_path = Path(__file__).parent / "fixtures" / "dense-6000-lines.pdf.gz"
+
+    opened, _ = submit_job(
+        client,
+        "/api/v1/edit/open",
+        files=[
+            (
+                "fileInput",
+                ("dense-6000-lines.pdf", gzip.decompress(source_path.read_bytes()), "application/pdf"),
+            )
+        ],
+    )
+    assert opened["state"] == "succeeded", opened.get("error")
+    doc_id = opened["result"]["docId"]
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        text_request = pool.submit(
+            client.get, f"/api/v1/edit/{doc_id}/pages/0/text"
+        )
+        time.sleep(0.03)
+        started = time.monotonic()
+        health = client.get("/api/health")
+        health_elapsed = time.monotonic() - started
+        response = text_request.result(timeout=15)
+
+    assert health.status_code == 200
+    assert health_elapsed < 0.25
+    assert response.status_code == 200, response.text[:500]
+    assert len(response.json()["page"]["lines"]) == 6000
 
 
 def test_large_editor_open_paginates_metadata_without_a_page_cap(client, tmp_path):

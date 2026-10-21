@@ -51,6 +51,39 @@ def test_spawn_worker_completes_and_idempotency_is_enforced(tmp_path):
     asyncio.run(scenario())
 
 
+def test_internal_worker_cancellation_terminates_process():
+    async def scenario():
+        manager = JobManager()
+        await manager.start()
+        task = asyncio.create_task(
+            manager.run_internal("test_sleep", {"seconds": 10})
+        )
+        try:
+            deadline = asyncio.get_running_loop().time() + 5
+            while manager._active_id is None and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
+            assert manager._active_id is not None
+            job_id = manager._active_id
+            job = manager.get(job_id)
+            process = job.process
+            assert process is not None and process.is_alive()
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert process.exitcode is not None
+            assert job.state == "cancelled"
+            assert job_id not in manager._records
+        finally:
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            await manager.stop()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("state", ["queued", "running", "succeeded", "failed", "cancelled"])
 def test_idempotent_retry_resolves_existing_job_before_preflight(state, tmp_path):
     manager = JobManager()

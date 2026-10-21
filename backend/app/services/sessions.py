@@ -46,6 +46,7 @@ class EditSession:
         self.page_metadata: list[dict] = []
         self.lock = threading.RLock()
         self.pending_job_id: str | None = None
+        self.active_text_reads = 0
         self.closed = False
         self.undo_stack: list[SessionHistoryEntry] = []
         self.redo_stack: list[SessionHistoryEntry] = []

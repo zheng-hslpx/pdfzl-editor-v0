@@ -21,7 +21,6 @@ from typing import Iterator
 
 from .. import config
 from .errors import PdfError
-from .input_validation import validate_pdf
 
 logger = logging.getLogger("pdf_editor.temp")
 
@@ -191,7 +190,19 @@ async def save_upload(upload, suffix: str = ".pdf", *, allow_encrypted: bool = F
                 fh.write(chunk)
                 digest.update(chunk)
         if suffix.lower() == ".pdf":
-            page_count = validate_pdf(dest, allow_encrypted=allow_encrypted)
+            # PDF parsing can traverse attacker-controlled xrefs and object
+            # streams. Keep it in the same budgeted, cancellable process queue
+            # used for other PyMuPDF work, rather than blocking this async route.
+            from ..services.jobs import job_manager
+
+            validation = await job_manager.run_internal(
+                "validate_pdf",
+                {
+                    "source_path": str(dest),
+                    "allow_encrypted": allow_encrypted,
+                },
+            )
+            page_count = validation.get("pageCount")
             if page_count is not None:
                 temp_manager.set_page_count(dest, page_count)
         temp_manager.set_digest(dest, digest.hexdigest())
