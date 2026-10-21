@@ -111,6 +111,29 @@ def test_dense_page_text_worker_keeps_health_responsive(client):
     assert len(response.json()["page"]["lines"]) == 6000
 
 
+def test_concurrent_page_text_reads_wait_for_the_bounded_worker_slot(client, sample_pdf):
+    opened, _ = submit_job(
+        client,
+        "/api/v1/edit/open",
+        files=[("fileInput", ("sample.pdf", sample_pdf.read_bytes(), "application/pdf"))],
+    )
+    assert opened["state"] == "succeeded", opened.get("error")
+    doc_id = opened["result"]["docId"]
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        responses = list(
+            pool.map(
+                lambda page_no: client.get(
+                    f"/api/v1/edit/{doc_id}/pages/{page_no}/text"
+                ),
+                range(3),
+            )
+        )
+
+    assert [response.status_code for response in responses] == [200, 200, 200]
+    assert [response.json()["page"]["page"] for response in responses] == [0, 1, 2]
+
+
 def test_large_editor_open_paginates_metadata_without_a_page_cap(client, tmp_path):
     source_path = tmp_path / "one-hundred-five-pages.pdf"
     source = fitz.open()

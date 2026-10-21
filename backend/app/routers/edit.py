@@ -17,6 +17,7 @@ which maps to the pdf.js viewport by uniform scaling, no flip needed.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import math
 from pathlib import Path
@@ -177,6 +178,7 @@ async def get_pages(
 @router.get("/{doc_id}/pages/{page_no}/text", summary="读取单页文本模型")
 async def get_page_text(doc_id: str, page_no: int):
     session = session_manager.get(doc_id)
+    task = asyncio.current_task()
     with session.lock:
         if session.pending_job_id is not None:
             raise PdfError(409, "文档修改任务仍在执行", code="SESSION_BUSY")
@@ -186,14 +188,29 @@ async def get_page_text(doc_id: str, page_no: int):
         page_id = session.page_ids[page_no]
         source_path = session.path
         session.active_text_reads += 1
+        if task is not None:
+            session.active_text_tasks.add(task)
     try:
-        result = await job_manager.run_internal(
-            "editor_page_text",
-            {"source_path": str(source_path), "page": page_no, "page_id": page_id},
-        )
+        deadline = asyncio.get_running_loop().time() + 10.0
+        while True:
+            try:
+                result = await job_manager.run_internal(
+                    "editor_page_text",
+                    {"source_path": str(source_path), "page": page_no, "page_id": page_id},
+                )
+                break
+            except PdfError as exc:
+                if exc.code != "JOB_QUEUE_FULL":
+                    raise
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise
+                await asyncio.sleep(min(0.05, remaining))
         with session.lock:
             if session.closed:
                 raise PdfError(404, "编辑会话不存在或已过期，请重新打开文件")
+            if session.closing:
+                raise PdfError(409, "编辑会话正在关闭", code="SESSION_BUSY")
             if session.revision != revision:
                 raise PdfError(
                     409,
@@ -203,8 +220,16 @@ async def get_page_text(doc_id: str, page_no: int):
             if session.pending_job_id is not None:
                 raise PdfError(409, "文档修改任务仍在执行", code="SESSION_BUSY")
         return {"docId": doc_id, "revision": revision, "page": result["page"]}
+    except asyncio.CancelledError:
+        with session.lock:
+            closing = session.closing
+        if closing:
+            raise PdfError(409, "编辑会话正在关闭", code="SESSION_BUSY")
+        raise
     finally:
         with session.lock:
+            if task is not None:
+                session.active_text_tasks.discard(task)
             session.active_text_reads = max(0, session.active_text_reads - 1)
 
 
@@ -646,8 +671,22 @@ async def close_session(doc_id: str):
         with session.lock:
             if session.pending_job_id is not None:
                 raise PdfError(409, "文档修改任务仍在执行，请先等待或取消任务", code="SESSION_BUSY")
-            if session.active_text_reads:
-                raise PdfError(409, "单页文本读取仍在执行，请稍后关闭", code="SESSION_BUSY")
+            session.closing = True
+            readers = list(session.active_text_tasks)
+        try:
+            for reader in readers:
+                reader.cancel()
+            if readers:
+                await asyncio.gather(*readers, return_exceptions=True)
+        except asyncio.CancelledError:
+            with session.lock:
+                if not session.closed:
+                    session.closing = False
+            raise
+        with session.lock:
+            if session.pending_job_id is not None or session.active_text_reads:
+                session.closing = False
+                raise PdfError(409, "文档读取或修改任务仍在结束，请稍后关闭", code="SESSION_BUSY")
             session_manager.close(doc_id)
     return {"ok": True}
 

@@ -6,6 +6,7 @@ so no long-lived document handles are held.
 """
 from __future__ import annotations
 
+import asyncio
 import shutil
 import logging
 import os
@@ -47,6 +48,8 @@ class EditSession:
         self.lock = threading.RLock()
         self.pending_job_id: str | None = None
         self.active_text_reads = 0
+        self.active_text_tasks: set[asyncio.Task] = set()
+        self.closing = False
         self.closed = False
         self.undo_stack: list[SessionHistoryEntry] = []
         self.redo_stack: list[SessionHistoryEntry] = []
@@ -92,6 +95,8 @@ class SessionManager:
         session = self._sessions.get(doc_id)
         if session is None or session.closed:
             raise PdfError(404, "编辑会话不存在或已过期，请重新打开文件")
+        if session.closing:
+            raise PdfError(409, "编辑会话正在关闭，请稍后重试", code="SESSION_BUSY")
         session.touch()
         return session
 

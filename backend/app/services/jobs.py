@@ -188,6 +188,31 @@ class JobManager:
                     session_manager.close(session_id)
                 raise
 
+        # Preserve session revision/busy errors even when the worker queue is
+        # saturated. This check is read-only; the reservation is still made
+        # atomically below before the job is enqueued.
+        if session_id is not None and expected_revision is not None:
+            try:
+                current_session = session_manager.get(session_id)
+                with current_session.lock:
+                    if current_session.revision != expected_revision:
+                        raise PdfError(
+                            409,
+                            "文档版本已变化，请刷新后重试",
+                            code="REVISION_CONFLICT",
+                        )
+                    if current_session.pending_job_id is not None:
+                        raise PdfError(
+                            409,
+                            "该文档已有任务正在处理",
+                            code="SESSION_BUSY",
+                        )
+            except BaseException:
+                self._discard_inputs(paths)
+                if cleanup_session_on_failure and session_id:
+                    session_manager.close(session_id)
+                raise
+
         if self._queue.full():
             self._discard_inputs(paths)
             if cleanup_session_on_failure and session_id:
