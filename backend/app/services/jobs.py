@@ -13,7 +13,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .. import config
 from ..core.errors import PdfError
@@ -149,6 +149,7 @@ class JobManager:
         history_policy: str | None = None,
         history_action: str | None = None,
         history_entry: SessionHistoryEntry | None = None,
+        preflight: Callable[[], None] | None = None,
     ) -> JobRecord:
         if self._queue is None:
             raise PdfError(503, "后台任务服务尚未启动", code="JOB_SERVICE_UNAVAILABLE")
@@ -158,20 +159,34 @@ class JobManager:
         paths = list(input_paths or [])
         namespace = idempotency_scope or session_id or "local"
         idem_index = (namespace, idempotency_key)
-        previous = self._idempotency.get(idem_index)
-        if previous is not None:
-            previous_hash, previous_job_id, _ = previous
-            if previous_hash != request_hash:
-                self._discard_inputs(paths)
-                if cleanup_session_on_failure and session_id:
-                    session_manager.close(session_id)
-                raise PdfError(409, "Idempotency-Key 已用于不同请求", code="IDEMPOTENCY_KEY_REUSED")
+        try:
+            existing = self.find_existing(
+                idempotency_key,
+                request_hash,
+                session_id=session_id,
+                idempotency_scope=idempotency_scope,
+            )
+        except BaseException:
             self._discard_inputs(paths)
             if cleanup_session_on_failure and session_id:
                 session_manager.close(session_id)
-            existing = self._records.get(previous_job_id)
-            if existing is not None:
-                return existing
+            raise
+        if existing is not None:
+            self._discard_inputs(paths)
+            if cleanup_session_on_failure and session_id:
+                session_manager.close(session_id)
+            return existing
+
+        # Request-specific checks may observe a revision or busy state changed
+        # by the original request. Resolve retries before running these checks.
+        if preflight is not None:
+            try:
+                preflight()
+            except BaseException:
+                self._discard_inputs(paths)
+                if cleanup_session_on_failure and session_id:
+                    session_manager.close(session_id)
+                raise
 
         if self._queue.full():
             self._discard_inputs(paths)
@@ -239,6 +254,30 @@ class JobManager:
         self._records[job_id] = job
         self._idempotency[idem_index] = (request_hash, job_id, time.time())
         return job
+
+    def find_existing(
+        self,
+        idempotency_key: str,
+        request_hash: str,
+        *,
+        session_id: str | None = None,
+        idempotency_scope: str | None = None,
+    ) -> JobRecord | None:
+        """Resolve a retry before route-level state preflights."""
+        if not idempotency_key or len(idempotency_key) > 128:
+            raise PdfError(422, "必须提供有效的 Idempotency-Key", code="IDEMPOTENCY_KEY_REQUIRED")
+        namespace = idempotency_scope or session_id or "local"
+        idem_index = (namespace, idempotency_key)
+        previous = self._idempotency.get(idem_index)
+        if previous is None:
+            return None
+        previous_hash, previous_job_id, _ = previous
+        if previous_hash != request_hash:
+            raise PdfError(409, "Idempotency-Key 已用于不同请求", code="IDEMPOTENCY_KEY_REUSED")
+        existing = self._records.get(previous_job_id)
+        if existing is None:
+            self._idempotency.pop(idem_index, None)
+        return existing
 
     @staticmethod
     def history_plan(session, mode: str = "snapshot") -> dict[str, Any]:

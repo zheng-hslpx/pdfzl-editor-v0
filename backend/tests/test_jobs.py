@@ -6,7 +6,7 @@ import os
 import pytest
 
 from app.core.errors import PdfError
-from app.services.jobs import JobManager
+from app.services.jobs import JobManager, JobRecord
 from app.services.sessions import session_manager
 
 
@@ -47,6 +47,53 @@ def test_spawn_worker_completes_and_idempotency_is_enforced(tmp_path):
             assert job.result == {"slept": 0.05}
         finally:
             await manager.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("state", ["queued", "running", "succeeded", "failed", "cancelled"])
+def test_idempotent_retry_resolves_existing_job_before_preflight(state, tmp_path):
+    manager = JobManager()
+    job = JobRecord(
+        id="existing-job",
+        operation="editor_apply",
+        payload={},
+        work_dir=tmp_path / "existing-job",
+        idempotency_key="retry-key",
+        request_hash="same-request",
+        session_id="session-id",
+        state=state,
+    )
+    manager._records[job.id] = job
+    manager._idempotency[("session-id", "retry-key")] = ("same-request", job.id, 0.0)
+    preflight_calls = []
+
+    async def scenario():
+        manager._queue = asyncio.Queue()
+        duplicate = await manager.submit(
+            "editor_apply",
+            {},
+            idempotency_key="retry-key",
+            request_hash="same-request",
+            session_id="session-id",
+            expected_revision=0,
+            preflight=lambda: preflight_calls.append(True),
+        )
+        assert duplicate is job
+        assert duplicate.state == state
+
+        with pytest.raises(PdfError) as mismatch:
+            await manager.submit(
+                "editor_apply",
+                {},
+                idempotency_key="retry-key",
+                request_hash="different-request",
+                session_id="session-id",
+                expected_revision=0,
+                preflight=lambda: preflight_calls.append(True),
+            )
+        assert mismatch.value.code == "IDEMPOTENCY_KEY_REUSED"
+        assert preflight_calls == []
 
     asyncio.run(scenario())
 

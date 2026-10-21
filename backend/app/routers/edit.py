@@ -290,6 +290,21 @@ async def _submit_history_action(
     history_policy: str,
 ):
     session = session_manager.get(doc_id)
+    request_hash = job_manager.fingerprint(
+        f"editor_history_{action}",
+        {
+            "docId": doc_id,
+            "expectedRevision": payload.expectedRevision,
+            "historyPolicy": history_policy or None,
+        },
+        [],
+    )
+    existing = job_manager.find_existing(
+        idempotency_key, request_hash, session_id=doc_id
+    )
+    if existing is not None:
+        return JSONResponse(status_code=202, content={"jobId": existing.id, "state": existing.state})
+
     with session.lock:
         _ensure_session_writable(session, payload.expectedRevision)
         source_stack = session.undo_stack if action == "undo" else session.redo_stack
@@ -332,11 +347,6 @@ async def _submit_history_action(
             else:
                 raise PdfError(409, "历史操作类型不受支持", code="HISTORY_ENTRY_INVALID")
 
-    request_hash = job_manager.fingerprint(
-        operation,
-        {**job_payload, "docId": doc_id, "expectedRevision": payload.expectedRevision, "historyAction": action},
-        [entry.id],
-    )
     job = await job_manager.submit(
         operation,
         job_payload,
@@ -424,11 +434,12 @@ async def apply_edits(
     history_policy: str = Header(default="", alias="History-Policy"),
 ):
     session = session_manager.get(doc_id)
-    _preflight_edits(session, payload)
     payload_dict = payload.model_dump()
     payload_dict.update({"source_path": str(session.path), "page_ids": list(session.page_ids)})
     request_hash = job_manager.fingerprint(
-        "editor_apply", {**payload_dict, "docId": doc_id}, []
+        "editor_apply",
+        {**payload_dict, "docId": doc_id, "historyPolicy": history_policy or None},
+        [],
     )
     job = await job_manager.submit(
         "editor_apply",
@@ -438,6 +449,7 @@ async def apply_edits(
         session_id=doc_id,
         expected_revision=payload.expectedRevision,
         history_policy=history_policy or None,
+        preflight=lambda: _preflight_edits(session, payload),
     )
     return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
 
@@ -450,14 +462,12 @@ async def add_text(
     history_policy: str = Header(default="", alias="History-Policy"),
 ):
     session = session_manager.get(doc_id)
-    _preflight_page_write(
-        session, payload.expectedRevision, payload.page, payload.pageId,
-        fitz.Rect(payload.x, payload.y, payload.x + 1, payload.y + 1),
-    )
     payload_dict = payload.model_dump()
     payload_dict.update({"source_path": str(session.path), "page_ids": list(session.page_ids)})
     request_hash = job_manager.fingerprint(
-        "editor_add_text", {**payload_dict, "docId": doc_id}, []
+        "editor_add_text",
+        {**payload_dict, "docId": doc_id, "historyPolicy": history_policy or None},
+        [],
     )
     job = await job_manager.submit(
         "editor_add_text",
@@ -467,6 +477,10 @@ async def add_text(
         session_id=doc_id,
         expected_revision=payload.expectedRevision,
         history_policy=history_policy or None,
+        preflight=lambda: _preflight_page_write(
+            session, payload.expectedRevision, payload.page, payload.pageId,
+            fitz.Rect(payload.x, payload.y, payload.x + 1, payload.y + 1),
+        ),
     )
     return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
 
@@ -491,10 +505,6 @@ async def add_image(
     img_path = await save_upload(image, suffix=Path(image.filename or "stamp.png").suffix or ".png")
     try:
         validate_image(img_path)
-        _preflight_page_write(
-            session, expectedRevision, page, pageId,
-            fitz.Rect(x, y, x + w, y + h),
-        )
         payload = {
             "source_path": str(session.path),
             "image_path": str(img_path),
@@ -507,7 +517,13 @@ async def add_image(
             "h": h,
         }
         request_hash = job_manager.fingerprint(
-            "editor_add_image", {**payload, "docId": doc_id, "expectedRevision": expectedRevision},
+            "editor_add_image",
+            {
+                **payload,
+                "docId": doc_id,
+                "expectedRevision": expectedRevision,
+                "historyPolicy": history_policy or None,
+            },
             [temp_manager.get_digest(img_path)],
         )
         job = await job_manager.submit(
@@ -519,6 +535,9 @@ async def add_image(
             session_id=doc_id,
             expected_revision=expectedRevision,
             history_policy=history_policy or None,
+            preflight=lambda: _preflight_page_write(
+                session, expectedRevision, page, pageId, fitz.Rect(x, y, x + w, y + h)
+            ),
         )
         return JSONResponse(status_code=202, content={"jobId": job.id, "state": job.state})
     except BaseException:

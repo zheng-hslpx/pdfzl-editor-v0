@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 import fitz
 import pytest
@@ -497,6 +498,51 @@ def test_stale_revision_and_line_anchor_are_rejected_without_mutation(client, sa
     assert response.status_code == 409
     assert response.json()["code"] == "REVISION_CONFLICT"
     assert client.get(f"/api/v1/edit/{doc_id}/download").content == before
+
+
+def test_apply_idempotency_retry_precedes_revision_preflight(client, sample_pdf):
+    data = _open(client, sample_pdf)
+    doc_id = data["docId"]
+    line = _find_line(data["textModel"], 0, "PAGE-1")
+    body = {
+        "expectedRevision": data["revision"],
+        "edits": [_edit_payload(line, 0, "IDEMPOTENT RESULT")],
+    }
+    key = "apply-idempotency-retry"
+    url = f"/api/v1/edit/{doc_id}/apply"
+
+    first = client.post(url, json=body, headers={"Idempotency-Key": key})
+    assert first.status_code == 202, first.text
+    job_id = first.json()["jobId"]
+
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        status = client.get(f"/api/v1/jobs/{job_id}")
+        assert status.status_code == 200, status.text
+        job = status.json()
+        if job["state"] in {"succeeded", "failed", "cancelled"}:
+            break
+        time.sleep(0.01)
+    assert job["state"] == "succeeded", job.get("error")
+    assert job["result"]["revision"] == data["revision"] + 1
+
+    retry = client.post(url, json=body, headers={"Idempotency-Key": key})
+    assert retry.status_code == 202, retry.text
+    assert retry.json() == {"jobId": job_id, "state": "succeeded"}
+
+    changed = {
+        **body,
+        "edits": [_edit_payload(line, 0, "DIFFERENT REQUEST")],
+    }
+    mismatch = client.post(url, json=changed, headers={"Idempotency-Key": key})
+    assert mismatch.status_code == 409
+    assert mismatch.json()["code"] == "IDEMPOTENCY_KEY_REUSED"
+
+    stale_new_request = client.post(
+        url, json=body, headers={"Idempotency-Key": "stale-new-request"}
+    )
+    assert stale_new_request.status_code == 409
+    assert stale_new_request.json()["code"] == "REVISION_CONFLICT"
 
 
 @pytest.mark.parametrize("angle", [90, 180, 270])
