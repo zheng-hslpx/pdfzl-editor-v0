@@ -366,6 +366,116 @@ def test_apply_batch_rejects_overlapping_regions_without_partial_commit(client, 
     assert any(item["text"] == "UNCHANGED SECOND ROW" for item in page_after["page"]["lines"])
 
 
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "LONG ENGLISH REPLACEMENT " * 80,
+        "超长中文替换内容" * 120,
+    ],
+    ids=["long-english", "long-chinese"],
+)
+def test_apply_rejects_replacement_that_cannot_fit_without_committing(client, tmp_path, replacement):
+    source_path = tmp_path / "overflow-replacement.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=500)
+    page.insert_text((40, 70), "ORIGINAL TARGET", fontsize=14)
+    doc.save(source_path)
+    doc.close()
+
+    data = _open(client, source_path)
+    line = _find_line(data["textModel"], 0, "ORIGINAL TARGET")
+    doc_id = data["docId"]
+    before_pdf = client.get(f"/api/v1/edit/{doc_id}/download").content
+    before_history = client.get(f"/api/v1/edit/{doc_id}/history").json()
+
+    job, _ = submit_job(
+        client,
+        f"/api/v1/edit/{doc_id}/apply",
+        json={
+            "expectedRevision": data["revision"],
+            "edits": [_edit_payload(line, 0, replacement)],
+        },
+    )
+
+    assert job["state"] == "failed"
+    assert job["error"]["code"] == "TEXT_OVERFLOW"
+    assert "无法完整放入编辑区域" in job["error"]["message"]
+    assert client.get(f"/api/v1/edit/{doc_id}/download").content == before_pdf
+    after_text = client.get(f"/api/v1/edit/{doc_id}/pages/0/text").json()
+    assert after_text["revision"] == data["revision"]
+    assert any(item["text"] == "ORIGINAL TARGET" for item in after_text["page"]["lines"])
+    assert client.get(f"/api/v1/edit/{doc_id}/history").json() == before_history
+
+
+def test_apply_multiline_replacement_that_fits_keeps_every_line(client, tmp_path):
+    source_path = tmp_path / "multiline-replacement.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=500)
+    page.insert_text((40, 100), "ORIGINAL TARGET", fontsize=22)
+    doc.save(source_path)
+    doc.close()
+
+    data = _open(client, source_path)
+    line = _find_line(data["textModel"], 0, "ORIGINAL TARGET")
+    job, _ = submit_job(
+        client,
+        f"/api/v1/edit/{data['docId']}/apply",
+        json={
+            "expectedRevision": data["revision"],
+            "edits": [_edit_payload(line, 0, "FIRST LINE\nSECOND LINE")],
+        },
+    )
+
+    assert job["state"] == "succeeded", job.get("error")
+    output = _download(client, data["docId"])
+    text = output[0].get_text()
+    assert "FIRST LINE" in text
+    assert "SECOND LINE" in text
+    assert "ORIGINAL TARGET" not in text
+    output.close()
+
+
+def test_apply_batch_overflow_rejects_all_edits_without_history_change(client, tmp_path):
+    source_path = tmp_path / "partially-overflowing-batch.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=500)
+    page.insert_text((40, 70), "FIRST ORIGINAL", fontsize=14)
+    page.insert_text((40, 130), "SECOND ORIGINAL", fontsize=14)
+    doc.save(source_path)
+    doc.close()
+
+    data = _open(client, source_path)
+    lines = data["textModel"][0]["lines"]
+    first = _find_line([data["textModel"][0]], 0, "FIRST ORIGINAL")
+    second = _find_line([data["textModel"][0]], 0, "SECOND ORIGINAL")
+    doc_id = data["docId"]
+    before_pdf = client.get(f"/api/v1/edit/{doc_id}/download").content
+    before_history = client.get(f"/api/v1/edit/{doc_id}/history").json()
+    assert len(lines) == 2
+
+    job, _ = submit_job(
+        client,
+        f"/api/v1/edit/{doc_id}/apply",
+        json={
+            "expectedRevision": data["revision"],
+            "edits": [
+                _edit_payload(first, 0, "VALID FIRST REPLACEMENT"),
+                _edit_payload(second, 0, "OVERFLOW " * 300),
+            ],
+        },
+    )
+
+    assert job["state"] == "failed"
+    assert job["error"]["code"] == "TEXT_OVERFLOW"
+    assert client.get(f"/api/v1/edit/{doc_id}/download").content == before_pdf
+    after_text = client.get(f"/api/v1/edit/{doc_id}/pages/0/text").json()
+    assert after_text["revision"] == data["revision"]
+    assert {item["text"] for item in after_text["page"]["lines"]} == {
+        "FIRST ORIGINAL", "SECOND ORIGINAL",
+    }
+    assert client.get(f"/api/v1/edit/{doc_id}/history").json() == before_history
+
+
 def test_replace_with_chinese(client, sample_pdf):
     data = _open(client, sample_pdf)
     doc_id = data["docId"]

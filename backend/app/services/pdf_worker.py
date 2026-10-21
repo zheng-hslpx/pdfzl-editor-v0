@@ -473,20 +473,25 @@ def _run_operation(operation: str, payload: dict[str, Any], work_dir: Path,
                             page.draw_rect(bbox, color=None, fill=(1, 1, 1))
                         continue
                     font = pdf_engine.pick_font(text)
-                    size = float(edit.get("fontSize") or max(bbox.height * 0.8, 6))
-                    while size >= 6:
+                    min_size = 6.0
+                    size = max(
+                        float(edit.get("fontSize") or max(bbox.height * 0.8, min_size)),
+                        min_size,
+                    )
+                    while True:
                         rc = page.insert_textbox(
                             bbox, text, fontname=font, fontsize=size,
                             align=fitz.TEXT_ALIGN_LEFT,
                         )
                         if rc >= 0:
                             break
-                        size *= 0.95
-                    else:
-                        page.insert_text(
-                            (bbox.x0 + 1, bbox.y1 - 1), text,
-                            fontname=font, fontsize=6,
-                        )
+                        if size <= min_size:
+                            raise PdfError(
+                                422,
+                                f"替换文字在第 {item['page_no'] + 1} 页无法完整放入编辑区域，请缩短文字后重试",
+                                code="TEXT_OVERFLOW",
+                            )
+                        size = max(min_size, size * 0.95)
             elif operation == "editor_add_text":
                 changed_page_ids.add(payload["pageId"])
                 page = _validate_anchor(

@@ -291,6 +291,22 @@ describe("editor dirty-draft protection", () => {
     expect(await screen.findByText("未保存")).toBeDefined();
   });
 
+  it("keeps an overflowing replacement draft after the backend rejects the save", async () => {
+    const overflowMessage = "替换文字在第 1 页无法完整放入编辑区域，请缩短文字后重试";
+    const replacement = "LONG REPLACEMENT ".repeat(120);
+    mocks.applyEdits.mockRejectedValue(new Error(overflowMessage));
+    const { container } = renderEditor();
+    await openSample(container);
+
+    fireEvent.change(container.querySelector("textarea")!, { target: { value: replacement } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    expect(await screen.findByText(overflowMessage)).toBeDefined();
+    expect((container.querySelector("textarea") as HTMLTextAreaElement).value).toBe(replacement);
+    expect(await screen.findByText("未保存")).toBeDefined();
+    expect((screen.getByRole("button", { name: "保存" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it("requires a non-sensitive confirmation before enabling local recovery and can clear it", async () => {
     const { container } = renderEditor();
     await openSample(container);

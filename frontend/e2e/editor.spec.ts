@@ -713,3 +713,20 @@ test("preserves a save-race draft as a visible conflict when its document versio
   expect(currentPage.page.lines.some((line) => line.text === "PAGE1 SECOND ORIGINAL")).toBe(true);
   expect(currentPage.page.lines.some((line) => line.text === "FIRST NEW INPUT DURING SAVE")).toBe(false);
 });
+
+test("keeps an overflowing replacement draft while the PDF revision stays unchanged", async ({ page }) => {
+  await page.goto("/editor");
+  const docId = await openSample(page);
+  const replacement = "VISIBLE-".repeat(100);
+
+  await page.locator("textarea").first().fill(replacement);
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+
+  await expect(page.getByText(/替换文字在第 1 页无法完整放入编辑区域/)).toBeVisible();
+  await expect(page.locator("textarea").first()).toHaveValue(replacement);
+  await expect(page.getByText("未保存", { exact: true })).toBeVisible();
+  const currentPage = await fetchPageText(page, docId);
+  expect(currentPage.revision).toBe(0);
+  expect(currentPage.page.lines.some((line) => line.text === "PAGE-1 EDITABLE")).toBe(true);
+  expect(currentPage.page.lines.some((line) => line.text === replacement)).toBe(false);
+});
