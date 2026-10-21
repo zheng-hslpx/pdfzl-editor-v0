@@ -1,25 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { Alert, Loader, Text } from "@mantine/core";
-
-type PdfjsModule = typeof import("pdfjs-dist");
-type PdfDocument = Awaited<ReturnType<PdfjsModule["getDocument"]>["promise"]>;
-type PdfLoadingTask = ReturnType<PdfjsModule["getDocument"]>;
-
-let pdfjsPromise: Promise<PdfjsModule> | null = null;
-
-function loadPdfjs(): Promise<PdfjsModule> {
-  pdfjsPromise ??= import("pdfjs-dist").then((mod) => {
-    mod.GlobalWorkerOptions.workerSrc = new URL(
-      "pdfjs-dist/build/pdf.worker.min.mjs",
-      import.meta.url,
-    ).href;
-    return mod;
-  });
-  return pdfjsPromise;
-}
+import type { PDFDocumentLoadingTask, PDFDocumentProxy } from "pdfjs-dist";
+import { openPdfDocument } from "../lib/pdfjs";
 
 export interface PdfViewerProps {
-  data: Uint8Array;
+  data: Blob | Uint8Array | ArrayBuffer;
   /** Render scale (CSS px per PDF pt). */
   scale?: number;
   onPageCount?: (count: number) => void;
@@ -27,32 +12,64 @@ export interface PdfViewerProps {
 
 /** PDF.js preview that holds canvases only for visible pages and their neighbors. */
 export function PdfViewer({ data, scale = 1.2, onPageCount }: PdfViewerProps) {
-  const [pdfDoc, setPdfDoc] = useState<PdfDocument | null>(null);
+  const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const onPageCountRef = useRef(onPageCount);
+
+  useEffect(() => {
+    onPageCountRef.current = onPageCount;
+  }, [onPageCount]);
 
   useEffect(() => {
     let cancelled = false;
-    let loadingTask: PdfLoadingTask | null = null;
+    let loadingTask: PDFDocumentLoadingTask | null = null;
+    let objectUrl: string | null = null;
+    let cleanupPromise: Promise<void> | null = null;
+    const releaseObjectUrl = () => {
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+        objectUrl = null;
+      }
+    };
+    const cleanup = () => {
+      if (cleanupPromise) return cleanupPromise;
+      const task = loadingTask;
+      loadingTask = null;
+      cleanupPromise = (async () => {
+        if (task) await task.destroy().catch(() => undefined);
+        releaseObjectUrl();
+      })();
+      return cleanupPromise;
+    };
     setLoading(true);
     setError(null);
     setPdfDoc(null);
 
     void (async () => {
       try {
-        const pdfjs = await loadPdfjs();
-        const task = pdfjs.getDocument({ data });
-        loadingTask = task;
-        if (cancelled) {
-          await task.destroy();
+        const source = data instanceof Blob ? (objectUrl = URL.createObjectURL(data)) : data;
+        const task = await openPdfDocument(source, {
+          copyData: true,
+          shouldCancel: () => cancelled,
+        });
+        if (!task) {
+          releaseObjectUrl();
           return;
         }
+        if (cancelled) {
+          await task.destroy().catch(() => undefined);
+          releaseObjectUrl();
+          return;
+        }
+        loadingTask = task;
         const loaded = await task.promise;
         if (cancelled) return;
         setPdfDoc(loaded);
-        onPageCount?.(loaded.numPages);
+        onPageCountRef.current?.(loaded.numPages);
         setLoading(false);
       } catch (reason) {
+        await cleanup();
         if (!cancelled) {
           setError(String(reason));
           setLoading(false);
@@ -62,9 +79,9 @@ export function PdfViewer({ data, scale = 1.2, onPageCount }: PdfViewerProps) {
 
     return () => {
       cancelled = true;
-      if (loadingTask) void loadingTask.destroy().catch(() => undefined);
+      void cleanup();
     };
-  }, [data, onPageCount]);
+  }, [data]);
 
   if (error) return <Alert color="red" title="无法渲染 PDF">{error}</Alert>;
   if (loading || !pdfDoc) return <Loader size="sm" />;
@@ -83,7 +100,7 @@ function PdfPreviewPage({
   pageNo,
   scale,
 }: {
-  pdfDoc: PdfDocument;
+  pdfDoc: PDFDocumentProxy;
   pageNo: number;
   scale: number;
 }) {

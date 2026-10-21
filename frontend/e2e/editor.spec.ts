@@ -253,6 +253,55 @@ test("shows task progress, prevents a duplicate submit, and requests cancellatio
   expect(cancelRequested).toBe(true);
 });
 
+test("renders PDF tool results under StrictMode across file changes and unmount", async ({ page }) => {
+  const pdfErrors: string[] = [];
+  page.on("pageerror", (error) => pdfErrors.push(error.message));
+  page.on("console", (message) => {
+    if (message.type() === "error" && /DataCloneError|detached|PDF worker/i.test(message.text())) {
+      pdfErrors.push(message.text());
+    }
+  });
+
+  const runPreview = async (path: string) => {
+    await page.locator('input[type="file"]').setInputFiles(path);
+    await page.getByRole("button", { name: "下一步：设置" }).click();
+    await page.getByRole("button", { name: "下一步：执行" }).click();
+    await page.getByRole("button", { name: "开始处理", exact: true }).click();
+    await expect(page.getByText("处理完成", { exact: true })).toBeVisible({ timeout: 30_000 });
+    const canvas = page.locator("canvas").first();
+    await expect(canvas).toBeVisible();
+    await expect.poll(() => canvas.evaluate((element) => (element as HTMLCanvasElement).width)).toBeGreaterThan(0);
+    await expect.poll(() => canvas.evaluate((element) => (element as HTMLCanvasElement).height)).toBeGreaterThan(0);
+    return canvas;
+  };
+
+  await page.goto("/tool/compress");
+  let canvas = await runPreview(fixturePath);
+  const firstPagePixels = await canvas.evaluate((element) => {
+    const canvas = element as HTMLCanvasElement;
+    const context = canvas.getContext("2d");
+    if (!context) return 0;
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    let nonWhite = 0;
+    for (let index = 0; index < pixels.length; index += 4) {
+      if (pixels[index] !== 255 || pixels[index + 1] !== 255 || pixels[index + 2] !== 255) nonWhite += 1;
+    }
+    return nonWhite;
+  });
+  expect(firstPagePixels).toBeGreaterThan(0);
+  await page.screenshot({ path: "test-results/f06-viewer-result.png", fullPage: true });
+
+  await page.getByRole("button", { name: "处理其他文件" }).click();
+  await page.getByRole("button", { name: "移除" }).click();
+  canvas = await runPreview(raceFixturePath);
+  expect(await canvas.evaluate((element) => (element as HTMLCanvasElement).width)).toBeGreaterThan(0);
+  expect(pdfErrors).toEqual([]);
+
+  await page.getByRole("link", { name: "全部工具", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "PDF 工具箱" })).toBeVisible();
+  expect(pdfErrors).toEqual([]);
+});
+
 test("launcher default origin loads the editor and accepts a PDF upload", async ({ page }) => {
   const launcher = readFileSync(join(import.meta.dirname, "../../start-editor.bat"), "utf8");
   expect(launcher).toContain('set "UI_URL=http://127.0.0.1:5173"');

@@ -16,10 +16,27 @@ export function loadPdfjs(): Promise<PdfjsModule> {
   return pdfjsPromise;
 }
 
+export interface OpenPdfOptions {
+  /** Copy typed-array input before giving ownership of its buffer to pdf.js. */
+  copyData?: boolean;
+  /** Avoid creating a loading task if the owning component was already cleaned up. */
+  shouldCancel?: () => boolean;
+}
+
+export function openPdfDocument(
+  source: Uint8Array | ArrayBuffer | string,
+  options?: OpenPdfOptions & { shouldCancel?: undefined },
+): Promise<PDFDocumentLoadingTask>;
+export function openPdfDocument(
+  source: Uint8Array | ArrayBuffer | string,
+  options: OpenPdfOptions & { shouldCancel: () => boolean },
+): Promise<PDFDocumentLoadingTask | null>;
 export async function openPdfDocument(
-  source: Uint8Array | string,
-): Promise<PDFDocumentLoadingTask> {
+  source: Uint8Array | ArrayBuffer | string,
+  options: OpenPdfOptions = {},
+): Promise<PDFDocumentLoadingTask | null> {
   const pdfjs = await loadPdfjs();
+  if (options.shouldCancel?.()) return null;
   if (typeof source === "string") {
     return pdfjs.getDocument({
       url: source,
@@ -28,5 +45,8 @@ export async function openPdfDocument(
       rangeChunkSize: 64 * 1024,
     });
   }
-  return pdfjs.getDocument({ data: source });
+  const data = options.copyData
+    ? source instanceof Uint8Array ? source.slice() : source.slice(0)
+    : source;
+  return pdfjs.getDocument({ data });
 }

@@ -365,24 +365,13 @@ function renderPreview(result: FileResult, kind: ResultKind): ReactNode {
 }
 
 function PdfPreview({ blob }: { blob: Blob }) {
-  const [data, setData] = useState<Uint8Array | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    void blob.arrayBuffer().then((buf) => {
-      if (!cancelled) setData(new Uint8Array(buf));
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [blob]);
-  if (!data) return null;
   return (
     <Box>
       <Title order={5} mb="xs">
         预览
       </Title>
       <Paper withBorder p="sm" radius="md" style={{ background: "#f8f9fa" }}>
-        <PdfViewer data={data} />
+        <PdfViewer data={blob} />
       </Paper>
     </Box>
   );

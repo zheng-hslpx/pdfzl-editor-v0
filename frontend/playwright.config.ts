@@ -6,6 +6,11 @@ const python = process.env.PYTHON ?? (process.platform === "win32" ? "python" : 
 const pythonCommand = /[\s]/.test(python) ? `"${python}"` : python;
 const tempRoot = join(tmpdir(), `pdfed-pw-${process.pid}`);
 const useBundledChromium = Boolean(process.env.CI);
+const appMode = process.env.PLAYWRIGHT_APP_MODE ?? "dev";
+const appPort = appMode === "preview" ? 4173 : 5173;
+const appCommand = appMode === "preview"
+  ? `npm run preview -- --host 127.0.0.1 --port ${appPort}`
+  : "npm run dev -- --host 127.0.0.1";
 
 export default defineConfig({
   testDir: "./e2e",
@@ -19,7 +24,7 @@ export default defineConfig({
     ["html", { outputFolder: "playwright-report", open: "never" }],
   ],
   use: {
-    baseURL: "http://127.0.0.1:5173",
+    baseURL: `http://127.0.0.1:${appPort}`,
     acceptDownloads: true,
     trace: "retain-on-failure",
     launchOptions: useBundledChromium
@@ -41,13 +46,13 @@ export default defineConfig({
       timeout: 120_000,
       env: {
         PDF_EDITOR_TEMP_DIR: join(tempRoot, "backend"),
-        PDF_EDITOR_UI_ORIGIN: "http://127.0.0.1:5173",
+        PDF_EDITOR_UI_ORIGIN: `http://127.0.0.1:${appPort}`,
       },
     },
     {
-      command: "npm run dev -- --host 127.0.0.1",
+      command: appCommand,
       cwd: import.meta.dirname,
-      url: "http://127.0.0.1:5173",
+      url: `http://127.0.0.1:${appPort}`,
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
     },
