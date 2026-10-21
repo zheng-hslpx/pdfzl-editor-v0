@@ -26,6 +26,7 @@ v0.2 的 F01–F13 整改和本机回归已通过，当前进入正式验收判�
 - 一个重任务运行、最多一个排队；队列满时返回 `429 JOB_QUEUE_FULL`。长任务返回 `202` 和 `jobId`，用 `GET /api/v1/jobs/{jobId}` 查询进度，用 `POST /api/v1/jobs/{jobId}/cancel` 请求取消。长任务使用 `Idempotency-Key` 防止重复提交。
 - PyMuPDF 重任务、单页文本提取、锚点预检和 PDF 内容校验在独立子进程执行，共用 worker 内存预算 2 GiB、任务墙钟预算 15 分钟和有界队列。超限会终止 worker 并清理任务产物；原会话文件保持不变。LibreOffice 子目录在强制终止后的所有清理边界尚未完整验证，见“已知限制”。
 - **24 MP** 是单页预览预算；超出时降低预览分辨率并提示。**160 MP** 是每个渲染批次的在途像素预算，不是整个导出的累计上限；处理后会释放每批像素缓冲。
+- PDF.js 预览打开有可取消的 **60 秒**总截止；模块/文档加载失败会显示重试入口。页面渲染异常显示页级错误和重试。预览组件持有 loading task，清理时先 `destroy()`，再释放其 Blob URL。
 - `/api/health` 是不依赖 LibreOffice 的轻量存活检查。`/api/health/ready` 返回缓存的 LibreOffice readiness；冷启动探测默认最多等待 20 秒，health 请求不会同步等待。探测超时时状态保持 `unknown`，5 秒后可重试；只有探测明确失败才报告 `not_ready`。本机真实冷启动 readiness 探测耗时约 13 秒。
 - 编辑会话在内存中，服务重启后不会恢复；活动编辑器定期 heartbeat，2 小时无活动后过期。关闭文件会立即清理会话。
 

@@ -320,6 +320,32 @@ test("renders PDF tool results under StrictMode across file changes and unmount"
   expect(pdfErrors).toEqual([]);
 });
 
+test("shows a retryable editor preview error and recovers after a transient PDF load failure", async ({ page }) => {
+  let pdfLoadAttempts = 0;
+  await page.route(
+    (url) => /\/api\/v1\/edit\/[^/]+\/download$/.test(url.pathname),
+    async (route) => {
+      pdfLoadAttempts += 1;
+      if (pdfLoadAttempts === 1) {
+        await route.fulfill({
+          status: 503,
+          contentType: "application/json",
+          body: JSON.stringify({ code: "TEMPORARY_PREVIEW_FAILURE", error: "temporary PDF preview failure" }),
+        });
+        return;
+      }
+      await route.continue();
+    },
+  );
+
+  await page.goto("/editor");
+  await openSample(page);
+  await expect(page.getByText("PDF 预览加载失败", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "重试预览", exact: true }).click();
+  await expect(page.locator('[data-page-number="0"] canvas')).toBeVisible();
+  expect(pdfLoadAttempts).toBe(2);
+});
+
 test("uses actual conversion output types for PDF, DOCX, ZIP, image, and text results", async ({ page }) => {
   test.setTimeout(180_000);
   page.setDefaultTimeout(10_000);

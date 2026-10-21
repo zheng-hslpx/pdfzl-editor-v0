@@ -28,7 +28,7 @@ import {
 } from "@tabler/icons-react";
 import { useBlocker } from "react-router-dom";
 import type { PDFDocumentLoadingTask, PDFDocumentProxy } from "pdfjs-dist";
-import { openPdfDocument } from "../lib/pdfjs";
+import { openPdfDocument, PDF_OPEN_TIMEOUT_MS, withPdfOpenDeadline } from "../lib/pdfjs";
 import { findUniqueAnchoredLine, isAnchorForCurrentLine } from "../lib/draftAnchors";
 import { formatSize, useFiles } from "../contexts/FileContext";
 import * as editorApi from "../api/editor";
@@ -115,6 +115,8 @@ export function EditorPage() {
   const visiblePages = useRef(new Set<number>());
   const [pdfReloadKey, setPdfReloadKey] = useState(0);
   const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null);
+  const [pdfLoading, setPdfLoading] = useState(false);
+  const [pdfLoadError, setPdfLoadError] = useState<string | null>(null);
 
   // editing state
   const [scale, setScale] = useState(1.2);
@@ -705,24 +707,57 @@ export function EditorPage() {
   useEffect(() => {
     if (!docId) {
       setPdfDoc(null);
+      setPdfLoading(false);
+      setPdfLoadError(null);
       return;
     }
     let cancelled = false;
+    const abortController = new AbortController();
     let loadingTask: PDFDocumentLoadingTask | null = null;
+    let cleanupPromise: Promise<void> | null = null;
+    const cleanup = () => {
+      if (cleanupPromise) return cleanupPromise;
+      const task = loadingTask;
+      loadingTask = null;
+      cleanupPromise = (async () => {
+        if (task) await task.destroy().catch(() => undefined);
+      })();
+      return cleanupPromise;
+    };
     setPdfDoc(null);
-    void openPdfDocument(`/api/v1/edit/${docId}/download`).then((task) => {
-      loadingTask = task;
-      if (cancelled) {
-        void task.destroy().catch(() => undefined);
-        return;
+    setPdfLoading(true);
+    setPdfLoadError(null);
+    const deadlineAt = Date.now() + PDF_OPEN_TIMEOUT_MS;
+    void (async () => {
+      try {
+        const task = await withPdfOpenDeadline(
+          openPdfDocument(`/api/v1/edit/${docId}/download`, {
+            shouldCancel: () => cancelled || abortController.signal.aborted,
+          }),
+          deadlineAt,
+          abortController.signal,
+        );
+        if (!task) return;
+        if (cancelled) {
+          await task.destroy().catch(() => undefined);
+          return;
+        }
+        loadingTask = task;
+        const loaded = await withPdfOpenDeadline(task.promise, deadlineAt, abortController.signal);
+        if (!cancelled) setPdfDoc(loaded);
+      } catch (reason) {
+        if (cancelled) return;
+        abortController.abort();
+        await cleanup();
+        if (!cancelled) setPdfLoadError(reason instanceof Error ? reason.message : String(reason));
+      } finally {
+        if (!cancelled) setPdfLoading(false);
       }
-      void task.promise.then((doc) => {
-        if (!cancelled) setPdfDoc(doc);
-      }).catch(() => undefined);
-    }).catch(() => undefined);
+    })();
     return () => {
       cancelled = true;
-      if (loadingTask) void loadingTask.destroy().catch(() => undefined);
+      abortController.abort();
+      void cleanup();
     };
   }, [docId, pdfReloadKey]);
 
@@ -1714,6 +1749,22 @@ export function EditorPage() {
         </Group>
       </Paper>
 
+      {pdfLoading && (
+        <Alert color="blue" title="正在加载 PDF 预览" w="100%">
+          正在打开页面画布；文本定位和草稿不会因此被清除。
+        </Alert>
+      )}
+      {pdfLoadError && (
+        <Alert color="red" title="PDF 预览加载失败" w="100%">
+          <Group justify="space-between" align="flex-start">
+            <Text size="sm">{pdfLoadError}</Text>
+            <Button size="xs" variant="light" onClick={() => setPdfReloadKey((key) => key + 1)}>
+              重试预览
+            </Button>
+          </Group>
+        </Alert>
+      )}
+
       {toast && (
         <Alert color="blue" w="100%">
           {toast}
@@ -1938,6 +1989,8 @@ function EditorCanvas(props: EditorCanvasProps) {
   const [nearViewport, setNearViewport] = useState(false);
   const [rendered, setRendered] = useState(false);
   const [previewLimited, setPreviewLimited] = useState(false);
+  const [renderError, setRenderError] = useState<string | null>(null);
+  const [renderRetry, setRenderRetry] = useState(0);
 
   const widthCss = page.width * scale;
   const heightCss = page.height * scale;
@@ -1975,6 +2028,7 @@ function EditorCanvas(props: EditorCanvasProps) {
   useEffect(() => {
     if (!pdfDoc || !canvasRef.current || !nearViewport) {
       setRendered(false);
+      setRenderError(null);
       const canvas = canvasRef.current;
       if (canvas) {
         canvas.width = 0;
@@ -1984,44 +2038,53 @@ function EditorCanvas(props: EditorCanvasProps) {
     }
     let cancelled = false;
     let renderTask: { promise: Promise<void>; cancel: () => void } | null = null;
+    let renderedPage: {
+      getViewport: (o: { scale: number; rotation: number }) => { width: number; height: number };
+      render: (o: Record<string, unknown>) => { promise: Promise<void>; cancel: () => void };
+      cleanup: () => void;
+    } | null = null;
+    setRendered(false);
+    setRenderError(null);
     (async () => {
-      const p = (await pdfDoc.getPage(page.page + 1)) as {
-        getViewport: (o: { scale: number; rotation: number }) => { width: number; height: number };
-        render: (o: Record<string, unknown>) => { promise: Promise<void>; cancel: () => void };
-        cleanup: () => void;
-      };
-      if (cancelled) {
-        p.cleanup();
-        return;
-      }
-      const dpr = window.devicePixelRatio || 1;
-      let renderScale = scale * dpr;
-      const requestedPixels = page.width * page.height * renderScale * renderScale;
-      const limit = 24_000_000;
-      if (requestedPixels > limit) {
-        renderScale *= Math.sqrt(limit / requestedPixels);
-        setPreviewLimited(true);
-      } else {
-        setPreviewLimited(false);
-      }
-      const viewport = p.getViewport({ scale: renderScale, rotation: page.rotation });
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      canvas.width = Math.floor(viewport.width);
-      canvas.height = Math.floor(viewport.height);
-      const ctx = canvas.getContext("2d");
-      if (ctx) {
+      try {
+        const p = await pdfDoc.getPage(page.page + 1) as NonNullable<typeof renderedPage>;
+        renderedPage = p;
+        if (cancelled) return;
+        const dpr = window.devicePixelRatio || 1;
+        let renderScale = scale * dpr;
+        const requestedPixels = page.width * page.height * renderScale * renderScale;
+        const limit = 24_000_000;
+        if (requestedPixels > limit) {
+          renderScale *= Math.sqrt(limit / requestedPixels);
+          setPreviewLimited(true);
+        } else {
+          setPreviewLimited(false);
+        }
+        const viewport = p.getViewport({ scale: renderScale, rotation: page.rotation });
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        canvas.width = Math.floor(viewport.width);
+        canvas.height = Math.floor(viewport.height);
+        const ctx = canvas.getContext("2d");
+        if (!ctx) throw new Error("浏览器无法创建 PDF 页面画布");
         renderTask = p.render({ canvas, canvasContext: ctx, viewport });
         await renderTask.promise;
+        if (!cancelled) setRendered(true);
+      } catch (reason) {
+        if (!cancelled) setRenderError(reason instanceof Error ? reason.message : String(reason));
+      } finally {
+        try {
+          renderedPage?.cleanup();
+        } catch {
+          // Keep cleanup errors from hiding the page render failure and retry action.
+        }
       }
-      p.cleanup();
-      if (!cancelled) setRendered(true);
-    })().catch(() => undefined);
+    })();
     return () => {
       cancelled = true;
       renderTask?.cancel();
     };
-  }, [nearViewport, pdfDoc, page.height, page.page, page.rotation, page.width, scale]);
+  }, [nearViewport, pdfDoc, page.height, page.page, page.rotation, page.width, renderRetry, scale]);
 
   const ptFromEvent = (clientX: number, clientY: number) => {
     const rect = containerRef.current?.getBoundingClientRect();
@@ -2090,7 +2153,17 @@ function EditorCanvas(props: EditorCanvasProps) {
             height: heightCss,
           }}
         />
-        {nearViewport && !rendered && <Text size="xs" c="dimmed">正在渲染第 {page.page + 1} 页…</Text>}
+        {renderError && (
+          <Alert color="red" title={`第 ${page.page + 1} 页渲染失败`} style={{ position: "absolute", inset: 8, zIndex: 5 }}>
+            <Stack gap="xs">
+              <Text size="xs">{renderError}</Text>
+              <Button size="xs" variant="light" onClick={() => setRenderRetry((attempt) => attempt + 1)}>
+                重试此页
+              </Button>
+            </Stack>
+          </Alert>
+        )}
+        {pdfDoc && nearViewport && !rendered && !renderError && <Text size="xs" c="dimmed">正在渲染第 {page.page + 1} 页…</Text>}
 
         {/* text overlays */}
         <div

@@ -5,14 +5,68 @@ type PdfjsModule = typeof import("pdfjs-dist");
 
 let pdfjsPromise: Promise<PdfjsModule> | null = null;
 
-export function loadPdfjs(): Promise<PdfjsModule> {
-  pdfjsPromise ??= import("pdfjs-dist").then((mod) => {
-    mod.GlobalWorkerOptions.workerSrc = new URL(
-      "pdfjs-dist/build/pdf.worker.min.mjs",
-      import.meta.url,
-    ).href;
-    return mod;
+export const PDF_OPEN_TIMEOUT_MS = 60_000;
+
+export class PdfOpenTimeoutError extends Error {
+  constructor() {
+    super("PDF 预览加载超时，请重试。");
+    this.name = "PdfOpenTimeoutError";
+  }
+}
+
+/** Wait until a shared open deadline while allowing the owning component to cancel. */
+export function withPdfOpenDeadline<T>(
+  promise: Promise<T>,
+  deadlineAt: number,
+  signal: AbortSignal,
+): Promise<T> {
+  if (signal.aborted) {
+    const error = new Error("PDF 预览加载已取消。");
+    error.name = "AbortError";
+    return Promise.reject(error);
+  }
+  const remainingMs = deadlineAt - Date.now();
+  if (remainingMs <= 0) return Promise.reject(new PdfOpenTimeoutError());
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = globalThis.setTimeout(() => settle("reject", new PdfOpenTimeoutError()), remainingMs);
+    const onAbort = () => {
+      const error = new Error("PDF 预览加载已取消。");
+      error.name = "AbortError";
+      settle("reject", error);
+    };
+    const settle = (kind: "resolve" | "reject", value: T | unknown) => {
+      if (settled) return;
+      settled = true;
+      globalThis.clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      if (kind === "resolve") resolve(value as T);
+      else reject(value);
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => settle("resolve", value),
+      (reason: unknown) => settle("reject", reason),
+    );
   });
+}
+
+export function loadPdfjs(): Promise<PdfjsModule> {
+  if (!pdfjsPromise) {
+    const loading = import("pdfjs-dist").then((mod) => {
+      mod.GlobalWorkerOptions.workerSrc = new URL(
+        "pdfjs-dist/build/pdf.worker.min.mjs",
+        import.meta.url,
+      ).href;
+      return mod;
+    });
+    pdfjsPromise = loading;
+    void loading.catch(() => {
+      if (pdfjsPromise === loading) pdfjsPromise = null;
+    });
+  }
   return pdfjsPromise;
 }
 

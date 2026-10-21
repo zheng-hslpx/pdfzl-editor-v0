@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { Alert, Loader, Text } from "@mantine/core";
+import { Alert, Button, Loader, Stack, Text } from "@mantine/core";
 import type { PDFDocumentLoadingTask, PDFDocumentProxy } from "pdfjs-dist";
-import { openPdfDocument } from "../lib/pdfjs";
+import { openPdfDocument, PDF_OPEN_TIMEOUT_MS, withPdfOpenDeadline } from "../lib/pdfjs";
 
 export interface PdfViewerProps {
   data: Blob | Uint8Array | ArrayBuffer;
@@ -15,6 +15,7 @@ export function PdfViewer({ data, scale = 1.2, onPageCount }: PdfViewerProps) {
   const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [loadRetry, setLoadRetry] = useState(0);
   const onPageCountRef = useRef(onPageCount);
 
   useEffect(() => {
@@ -23,6 +24,7 @@ export function PdfViewer({ data, scale = 1.2, onPageCount }: PdfViewerProps) {
 
   useEffect(() => {
     let cancelled = false;
+    const abortController = new AbortController();
     let loadingTask: PDFDocumentLoadingTask | null = null;
     let objectUrl: string | null = null;
     let cleanupPromise: Promise<void> | null = null;
@@ -45,14 +47,19 @@ export function PdfViewer({ data, scale = 1.2, onPageCount }: PdfViewerProps) {
     setLoading(true);
     setError(null);
     setPdfDoc(null);
+    const deadlineAt = Date.now() + PDF_OPEN_TIMEOUT_MS;
 
     void (async () => {
       try {
         const source = data instanceof Blob ? (objectUrl = URL.createObjectURL(data)) : data;
-        const task = await openPdfDocument(source, {
-          copyData: true,
-          shouldCancel: () => cancelled,
-        });
+        const task = await withPdfOpenDeadline(
+          openPdfDocument(source, {
+            copyData: true,
+            shouldCancel: () => cancelled || abortController.signal.aborted,
+          }),
+          deadlineAt,
+          abortController.signal,
+        );
         if (!task) {
           releaseObjectUrl();
           return;
@@ -63,15 +70,17 @@ export function PdfViewer({ data, scale = 1.2, onPageCount }: PdfViewerProps) {
           return;
         }
         loadingTask = task;
-        const loaded = await task.promise;
+        const loaded = await withPdfOpenDeadline(task.promise, deadlineAt, abortController.signal);
         if (cancelled) return;
         setPdfDoc(loaded);
         onPageCountRef.current?.(loaded.numPages);
         setLoading(false);
       } catch (reason) {
+        if (cancelled) return;
+        abortController.abort();
         await cleanup();
         if (!cancelled) {
-          setError(String(reason));
+          setError(reason instanceof Error ? reason.message : String(reason));
           setLoading(false);
         }
       }
@@ -79,12 +88,24 @@ export function PdfViewer({ data, scale = 1.2, onPageCount }: PdfViewerProps) {
 
     return () => {
       cancelled = true;
+      abortController.abort();
       void cleanup();
     };
-  }, [data]);
+  }, [data, loadRetry]);
 
-  if (error) return <Alert color="red" title="无法渲染 PDF">{error}</Alert>;
-  if (loading || !pdfDoc) return <Loader size="sm" />;
+  if (error) {
+    return (
+      <Alert color="red" title="PDF 预览失败">
+        <Stack gap="xs">
+          <Text size="sm">{error}</Text>
+          <Button size="xs" variant="light" onClick={() => setLoadRetry((attempt) => attempt + 1)}>
+            重试预览
+          </Button>
+        </Stack>
+      </Alert>
+    );
+  }
+  if (loading || !pdfDoc) return <Loader size="sm" aria-label="正在加载 PDF 预览" />;
 
   return (
     <div style={{ display: "grid", justifyItems: "center", gap: 16 }}>
@@ -109,6 +130,8 @@ function PdfPreviewPage({
   const [nearViewport, setNearViewport] = useState(false);
   const [rendered, setRendered] = useState(false);
   const [limited, setLimited] = useState(false);
+  const [renderError, setRenderError] = useState<string | null>(null);
+  const [renderRetry, setRenderRetry] = useState(0);
 
   useEffect(() => {
     const node = wrapperRef.current;
@@ -137,45 +160,48 @@ function PdfPreviewPage({
     }
     let cancelled = false;
     let renderTask: { promise: Promise<void>; cancel: () => void } | null = null;
+    let page: Awaited<ReturnType<PDFDocumentProxy["getPage"]>> | null = null;
+    setRendered(false);
+    setRenderError(null);
     void (async () => {
-      const page = await pdfDoc.getPage(pageNo);
-      if (cancelled) {
-        page.cleanup();
-        return;
-      }
-      const dpr = window.devicePixelRatio || 1;
-      let renderScale = scale * dpr;
-      const baseViewport = page.getViewport({ scale: renderScale });
-      const pixels = baseViewport.width * baseViewport.height;
-      if (pixels > 24_000_000) {
-        renderScale *= Math.sqrt(24_000_000 / pixels);
-        setLimited(true);
-      } else {
-        setLimited(false);
-      }
-      const viewport = page.getViewport({ scale: renderScale });
-      const canvas = canvasRef.current;
-      if (!canvas) {
-        page.cleanup();
-        return;
-      }
-      canvas.width = Math.ceil(viewport.width);
-      canvas.height = Math.ceil(viewport.height);
-      const context = canvas.getContext("2d");
-      if (context) {
+      try {
+        page = await pdfDoc.getPage(pageNo);
+        if (cancelled) return;
+        const dpr = window.devicePixelRatio || 1;
+        let renderScale = scale * dpr;
+        const baseViewport = page.getViewport({ scale: renderScale });
+        const pixels = baseViewport.width * baseViewport.height;
+        if (pixels > 24_000_000) {
+          renderScale *= Math.sqrt(24_000_000 / pixels);
+          setLimited(true);
+        } else {
+          setLimited(false);
+        }
+        const viewport = page.getViewport({ scale: renderScale });
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        canvas.width = Math.ceil(viewport.width);
+        canvas.height = Math.ceil(viewport.height);
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("浏览器无法创建 PDF 页面画布");
         renderTask = page.render({ canvas, canvasContext: context, viewport });
         await renderTask.promise;
+        if (!cancelled) setRendered(true);
+      } catch (reason) {
+        if (!cancelled) setRenderError(reason instanceof Error ? reason.message : String(reason));
+      } finally {
+        try {
+          page?.cleanup();
+        } catch {
+          // A failed render must not prevent the page from showing its retry state.
+        }
       }
-      page.cleanup();
-      if (!cancelled) setRendered(true);
-    })().catch((reason) => {
-      if (!cancelled) console.error("PDF preview page render failed", pageNo, reason);
-    });
+    })();
     return () => {
       cancelled = true;
       renderTask?.cancel();
     };
-  }, [nearViewport, pageNo, pdfDoc, scale]);
+  }, [nearViewport, pageNo, pdfDoc, renderRetry, scale]);
 
   return (
     <div
@@ -196,7 +222,17 @@ function PdfPreviewPage({
           height: "auto",
         }}
       />
-      {!rendered && nearViewport && <Loader size="sm" />}
+      {renderError && (
+        <Alert color="red" title={`第 ${pageNo} 页渲染失败`} style={{ position: "absolute", inset: 8, zIndex: 1 }}>
+          <Stack gap="xs">
+            <Text size="xs">{renderError}</Text>
+            <Button size="xs" variant="light" onClick={() => setRenderRetry((attempt) => attempt + 1)}>
+              重试此页
+            </Button>
+          </Stack>
+        </Alert>
+      )}
+      {!renderError && !rendered && nearViewport && <Loader size="sm" />}
       {limited && rendered && (
         <Text size="xs" c="dimmed" style={{ position: "absolute", right: 8, bottom: 4 }}>
           已降低预览分辨率以控制内存

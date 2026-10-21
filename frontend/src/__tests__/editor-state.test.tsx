@@ -33,7 +33,10 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../api/editor", () => mocks);
-vi.mock("../lib/pdfjs", () => ({ openPdfDocument: mocks.openPdfDocument }));
+vi.mock("../lib/pdfjs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/pdfjs")>()),
+  openPdfDocument: mocks.openPdfDocument,
+}));
 vi.mock("../lib/draftStore", () => ({
   clearAllDrafts: mocks.clearAllDrafts,
   createDraftId: mocks.createDraftId,
@@ -46,6 +49,7 @@ vi.mock("../lib/draftStore", () => ({
 
 afterEach(async () => {
   cleanup();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
   await new Promise((resolve) => setTimeout(resolve, 250));
 });
@@ -291,6 +295,66 @@ describe("editor dirty-draft protection", () => {
     expect(await screen.findByText("未保存")).toBeDefined();
   });
 
+  it("shows a retryable editor preview error and recovers on retry", async () => {
+    const failedTask = {
+      promise: new Promise<never>((_resolve, reject) => {
+        window.setTimeout(() => reject(new Error("temporary PDF read failure")), 0);
+      }),
+      destroy: vi.fn().mockResolvedValue(undefined),
+    };
+    const document = {
+      numPages: 1,
+      getPage: vi.fn().mockResolvedValue({
+        getViewport: () => ({ width: 714, height: 1010 }),
+        render: () => ({ promise: Promise.resolve(), cancel: vi.fn() }),
+        cleanup: vi.fn(),
+      }),
+    };
+    const retryTask = { promise: Promise.resolve(document), destroy: vi.fn().mockResolvedValue(undefined) };
+    mocks.openPdfDocument.mockResolvedValueOnce(failedTask).mockResolvedValueOnce(retryTask);
+    const { container } = renderEditor();
+    await openSample(container);
+
+    expect(await screen.findByText("temporary PDF read failure")).toBeDefined();
+    expect(screen.getByRole("button", { name: "重试预览" })).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "重试预览" }));
+    await waitFor(() => expect(mocks.openPdfDocument).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("第 1 页")).toBeDefined();
+    expect(screen.queryByText("temporary PDF read failure")).toBeNull();
+    expect(failedTask.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows and retries an editor canvas rendering error", async () => {
+    const getContext = vi.spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockReturnValue({} as CanvasRenderingContext2D);
+    let attempts = 0;
+    const document = {
+      numPages: 1,
+      getPage: vi.fn().mockResolvedValue({
+        getViewport: () => ({ width: 714, height: 1010 }),
+        render: () => ({
+          promise: ++attempts === 1 ? Promise.reject(new Error("editor canvas failure")) : Promise.resolve(),
+          cancel: vi.fn(),
+        }),
+        cleanup: vi.fn(),
+      }),
+    };
+    mocks.openPdfDocument.mockResolvedValue({
+      promise: Promise.resolve(document),
+      destroy: vi.fn().mockResolvedValue(undefined),
+    });
+    const { container } = renderEditor();
+    await openSample(container);
+
+    expect(await screen.findByText("editor canvas failure")).toBeDefined();
+    expect(screen.getByRole("button", { name: "重试此页" })).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "重试此页" }));
+    await waitFor(() => expect(document.getPage).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect((container.querySelector("canvas") as HTMLCanvasElement).style.display).toBe("block"));
+    expect(attempts).toBe(2);
+    getContext.mockRestore();
+  });
+
   it("keeps an overflowing replacement draft after the backend rejects the save", async () => {
     const overflowMessage = "替换文字在第 1 页无法完整放入编辑区域，请缩短文字后重试";
     const replacement = "LONG REPLACEMENT ".repeat(120);
@@ -432,7 +496,10 @@ describe("editor dirty-draft protection", () => {
 
     await waitFor(() => expect(mocks.fetchPageText).toHaveBeenCalledTimes(1));
     expect(mocks.fetchPageText).toHaveBeenCalledWith("session-1", 0);
-    expect(mocks.openPdfDocument).toHaveBeenCalledWith("/api/v1/edit/session-1/download");
+    expect(mocks.openPdfDocument).toHaveBeenCalledWith(
+      "/api/v1/edit/session-1/download",
+      expect.objectContaining({ shouldCancel: expect.any(Function) }),
+    );
   });
 
   it("keeps a 300-page document within a small rendered window and requests metadata by slice", async () => {
