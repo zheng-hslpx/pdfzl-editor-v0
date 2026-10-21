@@ -13,7 +13,7 @@ vi.mock("axios", () => ({
   },
 }));
 
-import { JobCancelledError, postJobBody, type JobProgress } from "../api/client";
+import { extractError, JobCancelledError, postJobBody, type JobProgress } from "../api/client";
 
 describe("client long-running jobs", () => {
   beforeEach(() => {
@@ -72,5 +72,80 @@ describe("client long-running jobs", () => {
 
     await expect(promise).resolves.toEqual({ ok: true });
     expect(progress.some((item) => item.cancelTooLate)).toBe(true);
+  });
+});
+
+describe("extractError", () => {
+  it("shows a structured business error returned by the API", async () => {
+    const error = Object.assign(new Error("Request failed with status code 422"), {
+      isAxiosError: true,
+      response: { status: 422, data: { error: "页码范围无效", code: "INVALID_INPUT" } },
+    });
+
+    await expect(extractError(error)).resolves.toBe("页码范围无效");
+  });
+
+  it("shows structured business errors returned as a blob", async () => {
+    const error = Object.assign(new Error("Request failed with status code 400"), {
+      isAxiosError: true,
+      response: {
+        status: 400,
+        data: new Blob([JSON.stringify({ error: "水印文字不能为空", code: "INVALID_INPUT" })], {
+          type: "application/json",
+        }),
+      },
+    });
+
+    await expect(extractError(error)).resolves.toBe("水印文字不能为空");
+  });
+
+  it("reports a network failure separately from API errors", async () => {
+    const error = Object.assign(new Error("Network Error"), {
+      isAxiosError: true,
+      code: "ERR_NETWORK",
+    });
+
+    await expect(extractError(error)).resolves.toBe(
+      "无法连接到本地服务，请确认 PDF Editor 服务正在运行。",
+    );
+  });
+
+  it("reports request cancellation separately from a network fault", async () => {
+    const error = Object.assign(new Error("canceled"), {
+      isAxiosError: true,
+      code: "ERR_CANCELED",
+    });
+
+    await expect(extractError(error)).resolves.toBe("请求已取消。");
+  });
+
+  it("preserves a known structured server-side operation error", async () => {
+    const error = Object.assign(new Error("Request failed with status code 500"), {
+      isAxiosError: true,
+      response: {
+        status: 500,
+        data: { error: "PDF 转 Word 失败", code: "CONVERSION_FAILED" },
+      },
+    });
+
+    await expect(extractError(error)).resolves.toBe("PDF 转 Word 失败");
+  });
+
+  it("hides unknown server exception details behind a stable message", async () => {
+    const error = Object.assign(new Error("Request failed with status code 500"), {
+      isAxiosError: true,
+      response: {
+        status: 500,
+        data: { error: "服务器内部错误", code: "INTERNAL_ERROR" },
+      },
+    });
+
+    await expect(extractError(error)).resolves.toBe("服务器发生未知错误（HTTP 500），请稍后重试。");
+  });
+
+  it("preserves ordinary non-Axios error messages", async () => {
+    await expect(extractError(new Error("local validation failed"))).resolves.toBe(
+      "local validation failed",
+    );
   });
 });

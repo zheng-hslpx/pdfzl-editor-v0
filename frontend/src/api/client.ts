@@ -209,22 +209,43 @@ export function downloadBlob(blob: Blob, filename: string): void {
 
 /** Extract a human-readable message from an axios error (JSON or blob body). */
 export async function extractError(err: unknown): Promise<string> {
-  if (err instanceof Error) return err.message;
   if (axios.isAxiosError(err)) {
+    const status = err.response?.status;
+    if (!err.response) {
+      if (err.code === "ERR_CANCELED") return "请求已取消。";
+      if (err.code === "ECONNABORTED" || err.code === "ETIMEDOUT") {
+        return "本地服务响应超时，请稍后重试。";
+      }
+      return "无法连接到本地服务，请确认 PDF Editor 服务正在运行。";
+    }
+
     const data = err.response?.data;
+    let message: string | undefined;
+    let code: string | undefined;
     if (data instanceof Blob) {
       try {
-        const json = JSON.parse(await data.text()) as { error?: string };
-        return json.error ?? `请求失败 (${err.response?.status ?? "?"})`;
+        const json = JSON.parse(await data.text()) as { error?: unknown; code?: unknown };
+        if (typeof json.error === "string") message = json.error;
+        if (typeof json.code === "string") code = json.code;
       } catch {
-        return `请求失败 (${err.response?.status ?? "?"})`;
+        // Fall through to the status-specific message below.
       }
+    } else if (typeof data === "object" && data !== null) {
+      const body = data as { error?: unknown; code?: unknown };
+      if (typeof body.error === "string") message = body.error;
+      if (typeof body.code === "string") code = body.code;
     }
-    if (typeof data === "object" && data !== null && "error" in data) {
-      return String((data as { error: unknown }).error);
+
+    if (status !== undefined && status >= 500 && (!message || !code || code === "INTERNAL_ERROR")) {
+      return `服务器发生未知错误（HTTP ${status}），请稍后重试。`;
     }
-    return err.message;
+    if (message) return message;
+    if (status !== undefined && status >= 500) {
+      return `服务器发生未知错误（HTTP ${status}），请稍后重试。`;
+    }
+    return `请求失败 (${status ?? "?"})`;
   }
+  if (err instanceof Error) return err.message;
   return String(err);
 }
 
