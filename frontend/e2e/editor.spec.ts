@@ -449,6 +449,83 @@ test("hides untrusted text overlays on rotated pages while rendering each page r
   expect((await rejectedWrite.json()).code).toBe("ROTATED_PAGE_UNSUPPORTED");
 });
 
+test("renders the review Chinese PDF with local CMaps and fonts", async ({ page }) => {
+  page.setDefaultTimeout(15_000);
+  const cmapResponses: Array<{ url: string; status: number }> = [];
+  const fontWarnings: string[] = [];
+  const externalRequests: string[] = [];
+  page.on("response", (response) => {
+    const url = new URL(response.url());
+    if (url.pathname.includes("/cmaps/")) cmapResponses.push({ url: url.href, status: response.status() });
+  });
+  page.on("console", (message) => {
+    if (message.type() === "warning" || message.type() === "error") {
+      if (/cMapUrl|standardFontDataUrl|font loading|loadFont/i.test(message.text())) fontWarnings.push(message.text());
+    }
+  });
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if ((url.protocol === "http:" || url.protocol === "https:")
+      && !["127.0.0.1", "localhost"].includes(url.hostname)) externalRequests.push(url.href);
+  });
+
+  await page.goto("/editor");
+  const pdfRequest = page.waitForRequest(
+    (request) => /\/api\/v1\/edit\/[^/]+\/download(?:\?|$)/.test(request.url()),
+    { timeout: 30_000 },
+  );
+  const sourcePath = join(import.meta.dirname, "fixtures", "mixed-cjk.pdf");
+  await page.locator('input[type="file"][accept=".pdf,application/pdf"]').setInputFiles(sourcePath);
+  const request = await pdfRequest;
+  const match = /\/api\/v1\/edit\/([^/]+)\/download/.exec(new URL(request.url()).pathname);
+  if (!match) throw new Error("Chinese PDF preview request did not include a docId");
+  await expect(page.getByText("mixed-cjk.pdf", { exact: true })).toBeVisible();
+
+  const pageFrame = page.locator('[data-page-number="0"]');
+  await pageFrame.scrollIntoViewIfNeeded();
+  const canvas = pageFrame.locator("canvas");
+  await expect(canvas).toBeVisible();
+  await expect.poll(() => canvas.evaluate((element) => (element as HTMLCanvasElement).width)).toBeGreaterThan(0);
+  await expect.poll(() => cmapResponses.some((response) => response.status === 200)).toBe(true);
+
+  const pixelCounts = await canvas.evaluate((element) => {
+    const canvas = element as HTMLCanvasElement;
+    const context = canvas.getContext("2d");
+    if (!context) return { cjk: 0, english: 0 };
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    const countDarkPixels = (x: number, y: number, width: number, height: number) => {
+      let count = 0;
+      for (let row = y; row < y + height; row += 1) {
+        for (let column = x; column < x + width; column += 1) {
+          const index = (row * canvas.width + column) * 4;
+          if (pixels[index]! < 245 && pixels[index + 1]! < 245 && pixels[index + 2]! < 245) count += 1;
+        }
+      }
+      return count;
+    };
+    return {
+      cjk: countDarkPixels(
+        Math.floor(canvas.width * 0.05), Math.floor(canvas.height * 0.24),
+        Math.floor(canvas.width * 0.38), Math.floor(canvas.height * 0.12),
+      ),
+      english: countDarkPixels(
+        Math.floor(canvas.width * 0.05), Math.floor(canvas.height * 0.08),
+        Math.floor(canvas.width * 0.55), Math.floor(canvas.height * 0.12),
+      ),
+    };
+  });
+  expect(pixelCounts.english).toBeGreaterThan(20);
+  expect(pixelCounts.cjk).toBeGreaterThan(20);
+  expect(cmapResponses.length).toBeGreaterThan(0);
+  expect(cmapResponses.every((response) => response.status === 200)).toBe(true);
+
+  const fontResponse = await page.request.get(`${new URL(page.url()).origin}/standard_fonts/FoxitSerif.pfb`);
+  expect(fontResponse.status()).toBe(200);
+  expect(fontWarnings).toEqual([]);
+  expect(externalRequests).toEqual([]);
+  await canvas.screenshot({ path: "test-results/f09-cjk-canvas.png" });
+});
+
 test("launcher default origin loads the editor and accepts a PDF upload", async ({ page }) => {
   const launcher = readFileSync(join(import.meta.dirname, "../../start-editor.bat"), "utf8");
   expect(launcher).toContain('set "UI_URL=http://127.0.0.1:5173"');

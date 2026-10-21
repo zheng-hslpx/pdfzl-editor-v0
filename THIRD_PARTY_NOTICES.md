@@ -51,6 +51,10 @@ Versions and license identifiers are taken from `frontend/package-lock.json`.
 | Vite | 7.3.7 | MIT |
 | Vitest | 4.1.12 | MIT |
 
+## Bundled PDF.js runtime assets
+
+`frontend/public/cmaps/` and `frontend/public/standard_fonts/` are copied from the locked `pdfjs-dist` 6.4.299 package so PDF.js can load these assets locally in development and production. The package's Adobe CMap license is retained at `frontend/public/cmaps/LICENSE`; standard font notices are retained at `frontend/public/standard_fonts/LICENSE_FOXIT` and `frontend/public/standard_fonts/LICENSE_LIBERATION`.
+
 ## External system component
 
 Office-to-PDF conversion uses the separately installed LibreOffice application. It is not installed from the Python or npm lock files and is not included in this repository's SBOMs. If redistributed, retain and review the notices supplied by the exact LibreOffice distribution.

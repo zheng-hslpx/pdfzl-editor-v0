@@ -44,4 +44,18 @@ describe("openPdfDocument byte ownership", () => {
     expect(result).toBeNull();
     expect(getDocument).not.toHaveBeenCalled();
   });
+
+  it("uses bundled CMaps and standard fonts for URL-based range loads", async () => {
+    getDocument.mockReturnValue(task);
+
+    await openPdfDocument("/api/v1/edit/session-1/download");
+
+    expect(getDocument).toHaveBeenCalledWith(expect.objectContaining({
+      url: "/api/v1/edit/session-1/download",
+      cMapUrl: `${window.location.origin}/cmaps/`,
+      cMapPacked: true,
+      standardFontDataUrl: `${window.location.origin}/standard_fonts/`,
+      disableStream: true,
+    }));
+  });
 });

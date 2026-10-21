@@ -23,6 +23,14 @@ export interface OpenPdfOptions {
   shouldCancel?: () => boolean;
 }
 
+function localPdfResources() {
+  return {
+    cMapUrl: new URL(`${import.meta.env.BASE_URL}cmaps/`, window.location.origin).href,
+    cMapPacked: true,
+    standardFontDataUrl: new URL(`${import.meta.env.BASE_URL}standard_fonts/`, window.location.origin).href,
+  };
+}
+
 export function openPdfDocument(
   source: Uint8Array | ArrayBuffer | string,
   options?: OpenPdfOptions & { shouldCancel?: undefined },
@@ -37,8 +45,10 @@ export async function openPdfDocument(
 ): Promise<PDFDocumentLoadingTask | null> {
   const pdfjs = await loadPdfjs();
   if (options.shouldCancel?.()) return null;
+  const resources = localPdfResources();
   if (typeof source === "string") {
     return pdfjs.getDocument({
+      ...resources,
       url: source,
       disableStream: true,
       disableAutoFetch: true,
@@ -48,5 +58,5 @@ export async function openPdfDocument(
   const data = options.copyData
     ? source instanceof Uint8Array ? source.slice() : source.slice(0)
     : source;
-  return pdfjs.getDocument({ data });
+  return pdfjs.getDocument({ ...resources, data });
 }
