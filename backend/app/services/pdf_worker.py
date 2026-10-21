@@ -878,10 +878,12 @@ def _run_operation(operation: str, payload: dict[str, Any], work_dir: Path,
                     else:
                         x = margin
                     point = _display_to_page_point(page, fitz.Point(x, y))
+                    # The point is mapped into page space; rotate the baseline
+                    # with the page so it reads left-to-right in display space.
                     page.insert_text(
                         point, label, fontname="helv", fontsize=size,
                         color=(0.35, 0.35, 0.35),
-                        rotate=(-page.rotation) % 360,
+                        rotate=page.rotation,
                     )
                     _progress(progress_queue, "processing", offset + 1, len(indices), "pages")
                 filename = f"{base}_numbered.pdf"

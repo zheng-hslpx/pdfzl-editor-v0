@@ -109,6 +109,63 @@ def test_add_page_numbers(client, sample_pdf):
     out.close()
 
 
+def test_page_numbers_keep_visual_direction_and_page_properties(client, tmp_path):
+    rotations = [0, 90, 180, 270]
+    source_path = tmp_path / "four-page-rotations.pdf"
+    source = fitz.open()
+    for index, rotation in enumerate(rotations):
+        page = source.new_page(width=612, height=792)
+        page.insert_text((72, 90), f"SOURCE-PAGE-{index + 1}", fontsize=18)
+        page.set_rotation(rotation)
+    source.set_metadata({"title": "Rotation page-number regression"})
+    original_pages = [
+        (page.rotation, tuple(page.mediabox), tuple(page.cropbox))
+        for page in source
+    ]
+    source.save(source_path)
+    source.close()
+
+    _, response = successful_job(
+        client,
+        "/api/v1/misc/add-page-numbers",
+        files=[_upload(source_path.name, source_path)],
+        data={"position": "bottom-right", "startNumber": 27, "margin": 36},
+    )
+    output_path = tmp_path / "numbered-four-page-rotations.pdf"
+    output_path.write_bytes(response.content)
+    out = _open(response.content)
+
+    assert out.page_count == 4
+    assert out.metadata["title"] == "Rotation page-number regression"
+    for index, page in enumerate(out):
+        assert (page.rotation, tuple(page.mediabox), tuple(page.cropbox)) == original_pages[index]
+        assert f"SOURCE-PAGE-{index + 1}" in page.get_text()
+        expected_label = str(27 + index)
+        line = next(
+            line
+            for block in page.get_text("dict")["blocks"]
+            if block.get("type") == 0
+            for line in block["lines"]
+            if expected_label in "".join(span["text"] for span in line["spans"])
+        )
+        display_bbox = fitz.Rect(line["bbox"]) * page.rotation_matrix
+        assert page.rect.contains(display_bbox)
+        assert display_bbox.x1 > page.rect.width - 120
+        assert display_bbox.y1 > page.rect.height - 100
+
+        direction = fitz.Point(*line["dir"])
+        origin = fitz.Point(0, 0) * page.rotation_matrix
+        endpoint = direction * page.rotation_matrix
+        display_direction = (endpoint.x - origin.x, endpoint.y - origin.y)
+        assert abs(display_direction[0] - 1) < 0.05
+        assert abs(display_direction[1]) < 0.05
+
+        rendered = page.get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False)
+        rendered.save(tmp_path / f"number-page-{index + 1}-rotation-{page.rotation}.png")
+        assert rendered.width > 0 and rendered.height > 0
+    out.close()
+
+
 @pytest.mark.parametrize("rotation", [90, 180, 270])
 def test_page_numbers_follow_rotated_display_coordinates(client, tmp_path, rotation):
     source_path = tmp_path / f"rotated-{rotation}.pdf"
