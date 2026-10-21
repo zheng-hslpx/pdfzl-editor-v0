@@ -77,7 +77,7 @@ async def lifespan(_: FastAPI):
         temp_manager.cleanup_old(0)  # dev shutdown: clear registry
 
 
-app = FastAPI(title="PDF Editor", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="PDF Editor", version="0.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
