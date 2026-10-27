@@ -4,18 +4,18 @@
 
 A single-user PDF toolkit that runs on your own machine. Documents stay local, and the backend and the Vite dev server bind to `127.0.0.1` by default. There is no authentication, so do not expose the service to a LAN or the internet. The design assumes local use, but nobody has audited every request the app makes at runtime.
 
-As of 2026-10-27, the F01-F13 defects, the four follow-up acceptance items, and the two display fixes are all done. The pytest, Vitest, TypeScript, production build, and E2E runs this machine requires all pass, in development and against the production preview. **PDF Editor v0.2.0 is recommended to pass formal acceptance for personal offline use.** It has not been published. Two areas are still unverified: cleanup of external temp directories after LibreOffice is force-killed, and behavior under extreme PDFs or resource pressure. Whether PyMuPDF ships under AGPL or an Artifex commercial license is an owner decision for any future public distribution; it does not block personal offline use. The product does not do OCR, forms, annotations, or real secure redaction. The tool registry has **11 entries**, and the "Format conversion" entry covers 5 conversions.
+As of 2026-10-27, the F01-F13 defects, the four follow-up acceptance items, and the two display fixes are all done. The pytest, Vitest, TypeScript, production build, and E2E runs this machine requires all pass, in development and against the production preview. **PDF Editor v0.2.0 is recommended to pass formal acceptance for personal offline use.** The source is public on GitHub, but there is no installer or Release yet, and the license choice for public distribution is still open. Two areas are still unverified: cleanup of external temp directories after LibreOffice is force-killed, and behavior under extreme PDFs or resource pressure. Whether PyMuPDF ships under AGPL or an Artifex commercial license is an owner decision for any future public distribution; it does not block personal offline use. The product does not do OCR, forms, annotations, or real secure redaction. The tool registry has **11 entries**, and the "Format conversion" entry covers 5 conversions.
 
 ## Version history
 
-The current version is 0.2.0. The backend (`FastAPI(version="0.2.0")`) and the frontend `package.json` agree on that number. The local tag `v0.2.0` points at `61c7442`, and two display fixes landed afterwards, so HEAD is `160be88`. There is no CHANGELOG, so the table below and the task lists under `tasks/` are the record.
+The current version is 0.2.0. The backend (`FastAPI(version="0.2.0")`) and the frontend `package.json` agree on that number. The tag `v0.2.0` points at `40a9736`, and two display fixes landed afterwards. There is no CHANGELOG, so the table below and the task lists under `tasks/` are the record.
 
 | Version | Date | Theme | Status |
 |---|---|---|---|
 | v0 | 2026-10-19 | First build: 16 backend endpoints, 12 frontend tools plus a visual editor | Replaced by v0.1 |
 | v0.1 | 2026-10-20 to 10-21 | Four engineering batches (A-D) driven by review findings | Replaced by v0.2.0 |
-| v0.2.0 | 2026-10-21 | F01-F13 fixes, four follow-up items, local offline acceptance | Archived as local tag `v0.2.0` |
-| v0.2.0 (current) | 2026-10-27 | Two display fixes: scanned-page text masks, shifted text on official documents | HEAD `160be88`, not pushed |
+| v0.2.0 | 2026-10-21 | F01-F13 fixes, four follow-up items, local offline acceptance | Tagged `v0.2.0` |
+| v0.2.0 (current) | 2026-10-27 | Two display fixes: scanned-page text masks, shifted text on official documents | Current main |
 
 ### v0.2.0 defect fixes (2026-10-21)
 
@@ -53,8 +53,8 @@ The current version is 0.2.0. The backend (`FastAPI(version="0.2.0")`) and the f
 
 ### Two display fixes (2026-10-27)
 
-- Text masks went missing in scanned PDFs (`cf358fc`). These scans are built from a pale full-page background plus a CCITTFaxDecode ImageMask text layer. PDF.js was given no `wasmUrl` and the decoders were not bundled, so the mask never drew. The fix adds a same-origin `wasmUrl` to the shared parameters, bundles the 13 WASM, JavaScript fallback, and license files for the pinned version, and brings the wasm set under the per-file SHA-256 check.
-- Unedited text on official-document pages shifted (`160be88`). Text nobody had touched was being redrawn by an opaque textarea in a substitute font. Idle lines now keep transparent text and background, so the original canvas glyphs, baselines, and widths show through, and the editor appears only on focus or when a line has changed. A blurred draft stays visible. Undoing back to the original text, or saving and reloading, brings the canvas look back. Find uses a translucent highlight.
+- Text masks went missing in scanned PDFs (`b416b3d`). These scans are built from a pale full-page background plus a CCITTFaxDecode ImageMask text layer. PDF.js was given no `wasmUrl` and the decoders were not bundled, so the mask never drew. The fix adds a same-origin `wasmUrl` to the shared parameters, bundles the 13 WASM, JavaScript fallback, and license files for the pinned version, and brings the wasm set under the per-file SHA-256 check.
+- Unedited text on official-document pages shifted (`33f297d`). Text nobody had touched was being redrawn by an opaque textarea in a substitute font. Idle lines now keep transparent text and background, so the original canvas glyphs, baselines, and widths show through, and the editor appears only on focus or when a line has changed. A blurred draft stays visible. Undoing back to the original text, or saving and reloading, brings the canvas look back. Find uses a translucent highlight.
 
 ### Test counts by stage
 
