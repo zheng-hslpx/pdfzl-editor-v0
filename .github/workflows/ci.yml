@@ -1,4 +1,4 @@
-name: v0.1 CI
+name: CI
 
 on:
   push:
@@ -9,40 +9,6 @@ permissions:
   contents: read
 
 jobs:
-  backend-linux:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-          cache: pip
-          cache-dependency-path: backend/requirements-dev.lock
-      - name: Install locked development dependencies
-        run: python -m pip install -r backend/requirements-dev.lock
-      - name: Run backend tests
-        run: python -m pytest backend/tests -ra --junitxml=backend/pytest-linux.xml
-      - name: Create Python SBOM and audit report
-        if: always()
-        run: |
-          mkdir -p artifacts
-          set +e
-          pip-audit -r backend/requirements-dev.lock --disable-pip --no-deps --format=json --output artifacts/python-audit.json
-          audit_status=$?
-          cyclonedx-py environment --gather-license-texts --output-reproducible --output-file artifacts/python-sbom.json
-          sbom_status=$?
-          set -e
-          if [ "$audit_status" -ne 0 ]; then exit "$audit_status"; fi
-          exit "$sbom_status"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: backend-linux-evidence
-          path: |
-            backend/pytest-linux.xml
-            artifacts/python-sbom.json
-            artifacts/python-audit.json
-
   backend-windows-libreoffice:
     runs-on: windows-2022
     env:
@@ -64,6 +30,9 @@ jobs:
         run: python -m pip install -r backend/requirements-dev.lock
       - name: Run backend tests with real LibreOffice
         run: python -m pytest backend/tests -ra --junitxml=backend/pytest-windows.xml
+      - name: Report failing tests as annotations
+        if: failure()
+        run: python .github/scripts/report_failures.py backend/pytest-windows.xml
       - uses: actions/upload-artifact@v4
         if: always()
         with:

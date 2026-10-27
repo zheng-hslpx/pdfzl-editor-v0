@@ -143,7 +143,7 @@ npm run test:e2e
 
 `npm run check:pdfjs-resources` 先比对已安装的 `pdfjs-dist` 版本和 `package-lock.json` 里锁定的版本，再逐文件核对本地 CMap、standard-font 与 WASM 解码器资源集合及其 SHA-256，包含 JavaScript fallback 和必需的许可证文件。脚本只报告差异，不改资源加载配置，也不复制文件。
 
-Playwright 配置会启动本地后端和 Vite。可以用 `PYTHON` 指定启动后端的解释器，这个解释器要装好后端锁定依赖（含 `uvicorn`）。开发机默认用已安装的 Chrome，CI 用 Playwright Chromium。GitHub Actions 分设 Linux 后端、Windows + LibreOffice 后端、TypeScript / Vitest / Vite build、Chromium E2E、SBOM 与依赖审计几类任务，并归档测试结果和审计报告。每次 pytest 的通过数、跳过数和跳过原因以 CI 报告为准，跳过不记作通过。
+Playwright 配置会启动本地后端和 Vite。可以用 `PYTHON` 指定启动后端的解释器，这个解释器要装好后端锁定依赖（含 `uvicorn`）。开发机默认用已安装的 Chrome，CI 用 Playwright Chromium。GitHub Actions 上跑两个任务：Windows + LibreOffice 的后端测试，以及前端检查（TypeScript、Vitest、production build、Chromium E2E、依赖审计与 SBOM），并归档测试结果和审计报告。项目按 Windows 本机使用交付，CI 不覆盖 Linux。每次 pytest 的通过数、跳过数和跳过原因以 CI 报告为准，跳过不记作通过。
 
 前端要求 Node.js 22.22.2 或更新的兼容版本。安装命令和 CI 一致，用 `--legacy-peer-deps` 绕开 npm 10 解析 Vitest 4 可选 peer 依赖树时的崩溃；测试需要的 `@testing-library/dom` 已经列为直接开发依赖。
 
