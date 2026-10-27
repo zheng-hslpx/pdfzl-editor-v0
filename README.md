@@ -1,73 +1,136 @@
-# PDF Editor v0.2
+# PDF Editor v0.2.0
 
-本机运行的单用户 PDF 工具。文档在本机处理；后端与 Vite 默认只监听 `127.0.0.1`。服务没有登录鉴权；请勿绑定到局域网或公网地址。项目按本机处理设计，但尚未完成全量运行时网络外呼审计。
+**English** | [简体中文](README_CN.md)
 
-截至 2026-10-21，F01–F13 和四项最终验收补充整改已完成，本机规定的 pytest、Vitest、TypeScript、production build 及开发/production E2E 均通过。**建议 PDF Editor v0.2 通过个人离线自用正式验收**；尚未公开发布。LibreOffice 强制终止后的外部临时目录清理、极端 PDF 与资源压力尚未穷尽验证。PyMuPDF 许可路线是未来公开分发前的所有者决策，不是个人离线自用验收阻断项。产品范围不含 OCR、表单、批注或真正的安全 redaction。当前工具注册表有 **11 个入口**；“格式转换”入口内含 5 种转换。
+A single-user PDF toolkit that runs on your own machine. Documents stay local, and the backend and the Vite dev server bind to `127.0.0.1` by default. There is no authentication, so do not expose the service to a LAN or the internet. The design assumes local use, but nobody has audited every request the app makes at runtime.
 
-## 功能
+As of 2026-10-27, the F01-F13 defects, the four follow-up acceptance items, and the two display fixes are all done. The pytest, Vitest, TypeScript, production build, and E2E runs this machine requires all pass, in development and against the production preview. **PDF Editor v0.2.0 is recommended to pass formal acceptance for personal offline use.** It has not been published. Two areas are still unverified: cleanup of external temp directories after LibreOffice is force-killed, and behavior under extreme PDFs or resource pressure. Whether PyMuPDF ships under AGPL or an Artifex commercial license is an owner decision for any future public distribution; it does not block personal offline use. The product does not do OCR, forms, annotations, or real secure redaction. The tool registry has **11 entries**, and the "Format conversion" entry covers 5 conversions.
 
-| 分类 | 能力 |
+## Version history
+
+The current version is 0.2.0. The backend (`FastAPI(version="0.2.0")`) and the frontend `package.json` agree on that number. The local tag `v0.2.0` points at `61c7442`, and two display fixes landed afterwards, so HEAD is `160be88`. There is no CHANGELOG, so the table below and the task lists under `tasks/` are the record.
+
+| Version | Date | Theme | Status |
+|---|---|---|---|
+| v0 | 2026-10-19 | First build: 16 backend endpoints, 12 frontend tools plus a visual editor | Replaced by v0.1 |
+| v0.1 | 2026-10-20 to 10-21 | Four engineering batches (A-D) driven by review findings | Replaced by v0.2.0 |
+| v0.2.0 | 2026-10-21 | F01-F13 fixes, four follow-up items, local offline acceptance | Archived as local tag `v0.2.0` |
+| v0.2.0 (current) | 2026-10-27 | Two display fixes: scanned-page text masks, shifted text on official documents | HEAD `160be88`, not pushed |
+
+### v0.2.0 defect fixes (2026-10-21)
+
+**Editing and drafts**
+
+- F01 (P0) Typing during a save moved drafts onto other lines. Draft anchors now carry page identity, document version, original text and its hash, and geometry. After a save, a draft is relocated only when the committed text, the original position, and the current revision identify one line unambiguously. Drafts that fail that check stay in a separate notice area and cannot be written again, and text extraction no longer overwrites an existing semantic anchor.
+- F02 (P1) Saving several lines on one page in a batch tripped over its own anchors. The worker caches the text model per page against an unchanged snapshot and runs the out-of-bounds and overlap checks first. It then applies covers in original coordinates page by page and writes the replacement text last. Overlapping regions return `OVERLAPPING_EDITS` and the job is not committed.
+- F03 (P1) Browser Back got around the unsaved-draft guard. Navigation now goes through React Router's data-router `useBlocker`, which covers POP, forward, in-app links, and programmatic navigation. Cancelling resets the block and keeps the draft and session. Saving commits and exports a copy before leaving, and the save and discard buttons are disabled while a save is running.
+
+**Rendering and preview**
+
+- F06 (P2) PDF result previews failed in development mode because the buffer had already been transferred. `PdfViewer` reuses the shared PDF.js loader and loads results straight from a Blob URL, releasing it after `PDFDocumentLoadingTask.destroy()`. Component cleanup cancels the task, and stable callbacks no longer start a second load.
+- F08 (P2) Rotated pages still showed a text overlay that had not been rotated. `EditorCanvas` renders the overlay only at `rotation=0`. Pages at 90°, 180°, and 270° keep the canvas rotated by the PDF.js viewport, and the UI says the overlay is hidden and coordinate editing is off.
+- F09 (P2) With no local CMap, Chinese glyphs went missing on the canvas. The shared loader now sets same-origin `cMapUrl`, `cMapPacked`, and `standardFontDataUrl` for URL, ArrayBuffer, and Uint8Array inputs. The repo carries 169 CMap files and 16 standard-font files that match the pinned `pdfjs-dist@6.4.299`, along with their license files.
+
+**Conversion and output**
+
+- F07 (P2) Result types were inferred wrongly, so DOCX and multi-page image results opened the wrong previewer. Detection now uses the output Blob's actual MIME type and file extension; when the two disagree, the result is treated as unknown rather than guessed from the conversion direction. Only PDF gets the PDF.js preview and an edit entry. DOCX, ZIP, and anything else that cannot be previewed shows the filename, format, MIME type, and a download link.
+- F12 (P2) Page numbers on 90° and 270° pages came out reversed. Anchors are still transformed from display coordinates back to page coordinates, but the drawing baseline now rotates with `page.rotation`. All four orientations read left to right on screen, and the page rotation metadata is untouched.
+- F13 (P2) Overlong watermarks were clipped past the page edge and still reported success. The bounding box now comes from measured text width, font size, wrapped height, and rotation angle, and the text scales down to fit the visible page, never below 8 pt. A user size that is already below 8 pt is kept. When nothing readable fits, the call returns `WATERMARK_OVERFLOW` and writes no file.
+
+**Service and launcher**
+
+- F04 (P1) The one-click launcher advertised one URL while the backend Origin list expected another. `UI_URL=http://127.0.0.1:5173` is now the only page address, and the readiness probe is derived from it. `curl.exe --fail` treats 4xx and 5xx as not ready, and the backend Origin allowlist stays as small as it was.
+- F05 (P2) Idempotent writes checked revision and busy state before looking up the idempotency record, so retrying a request that had already succeeded returned 409. `JobManager` resolves the record first: an identical request returns the existing job, while the same key with a different body or `History-Policy` returns `IDEMPOTENCY_KEY_REUSED`. New requests still get the revision, busy, anchor, and session lock checks.
+- F10 (P2) Single-page text reads and anchor preflights ran on the API event loop. Text extraction, upload validation, and write preflights now run in spawn workers behind a single-active-worker queue with a 2 GiB memory budget, a 15-minute timeout, and process cancellation. A text read waits up to 10 seconds for a free slot, and upload validation waits up to 5 seconds.
+- F11 (P2) Content validation accepted images disguised as PDFs. Parsed uploads are checked with PyMuPDF's `document.is_pdf`, and the engine's public `open_pdf` rejects non-PDF documents a second time. Both paths report `INVALID_PDF` with no local paths in the message.
+
+### Four follow-up items (2026-10-21)
+
+- Long replacement text was silently truncated. When a textbox cannot fit the text even at the 6 pt minimum, the call returns `TEXT_OVERFLOW` instead of drawing on an unconstrained baseline. A worker failure leaves the session untouched, and the frontend keeps the draft.
+- The draft-recovery E2E test was flaky. Its assertion for the recovery notice ran after a long text wait, by which point the notice had closed itself. Both assertions stay. The notice assertion now runs right after the "Recover" click, with no change to the notice timing, the assertion count, or the absence of fixed sleeps.
+- Preview failures had no recovery path. Opening a PDF now has a cancellable 60-second deadline. Load failures and timeouts show a retry, and a rejected page render shows a page-level error with retry. Each preview effect owns its loading task and cancellation signal, and destroys the task and revokes the Blob URL on failure, retry, or unmount.
+- PDF.js resources now have a version check. `npm run check:pdfjs-resources` compares the pinned and installed versions, then verifies the CMap, standard-font, and SHA-256 file sets. License files must be present, and tampered resources are rejected.
+
+### Two display fixes (2026-10-27)
+
+- Text masks went missing in scanned PDFs (`cf358fc`). These scans are built from a pale full-page background plus a CCITTFaxDecode ImageMask text layer. PDF.js was given no `wasmUrl` and the decoders were not bundled, so the mask never drew. The fix adds a same-origin `wasmUrl` to the shared parameters, bundles the 13 WASM, JavaScript fallback, and license files for the pinned version, and brings the wasm set under the per-file SHA-256 check.
+- Unedited text on official-document pages shifted (`160be88`). Text nobody had touched was being redrawn by an opaque textarea in a substitute font. Idle lines now keep transparent text and background, so the original canvas glyphs, baselines, and widths show through, and the editor appears only on focus or when a line has changed. A blurred draft stays visible. Undoing back to the original text, or saving and reloading, brings the canvas look back. Find uses a translucent highlight.
+
+### Test counts by stage
+
+| Stage | pytest | Vitest | E2E (development / production preview) |
+|---|---|---|---|
+| v0 | 51 | 4 | Playwright smoke scenarios and screenshot review |
+| v0.1 | 90 (0 skipped) | 22/22 | 3/3 |
+| v0.2.0 | 115 (0 skipped) | 54/54 | 16/16 / 16/16 |
+| v0.2.0 (current) | 115 | 56/56 | 18/18 / 18/18 |
+
+Those numbers are what each stage recorded at acceptance and do not carry forward. Pass, skip, and skip-reason counts for a given run come from that run's CI or local report. A skip is not a pass.
+
+## Features
+
+| Category | Capability |
 |---|---|
-| 文件组织 | 合并 PDF、拆分为 ZIP、旋转、删除和重排页面 |
-| 格式转换 | PDF→图片/文本/Word、图片→PDF、Office→PDF |
-| 其他工具 | PDF 对象优化、文字水印（自适应缩放或明确报错）、页码（含旋转页）、文档信息 |
-| 可视化编辑器 | 修改文本行、添加文字/图片、视觉遮挡、旋转/删除/移动页面、查找、高亮、保存/另存为、撤销/重做 |
-| 大任务 | 后台任务进度、取消、幂等提交；PDF 渲染按页或批次处理 |
-| 浏览器恢复 | 用户逐文档主动开启的 IndexedDB 缓存；默认关闭 |
+| File organization | Merge PDFs, split to ZIP, rotate, delete, and reorder pages |
+| Format conversion | PDF→image / text / Word, image→PDF, Office→PDF |
+| Other tools | PDF object optimization, text watermark (adaptive scaling or an explicit error), page numbers (rotated pages included), document info |
+| Visual editor | Edit text lines, add text or images, visual covers, rotate / delete / move pages, find, highlight, save / save as, undo / redo |
+| Large jobs | Background job progress, cancellation, idempotent submission; PDF rendering per page or batch |
+| Browser recovery | Per-document IndexedDB cache the user turns on, off by default |
 
-文本替换会重排文本行，原字体和字距不保证保留。旋转页目前不能在编辑器中改字、加字、加图或遮挡；先用旋转工具归一化页面。
+Text replacement reflows the text lines, so the original font and letter spacing are not guaranteed. Rotated pages cannot be edited in the editor yet, and you cannot add text, images, or covers to them. Normalize them with the rotate tool first.
 
-编辑器的白色覆盖是视觉遮挡，不能作为安全脱敏使用，也不保证清除底层图像或其他 PDF 对象。需要不可恢复地删除敏感内容时，请使用经过验证的安全 redaction 工具并检查输出。
+The white cover in the editor is a visual overlay. It is not secure redaction, and it does not guarantee removal of the underlying image or other PDF objects. To delete sensitive content beyond recovery, use a validated secure redaction tool and check the output.
 
-## 运行和资源边界
+## Runtime and resource boundaries
 
-- 单个上传文件上限为 **600 MiB**（`600 × 1024 × 1024` 字节）。`multipart/form-data` 请求另按完整请求体计 **600 MiB**，包括所有文件、字段和边界；超限返回 `413 UPLOAD_TOO_LARGE`。此中间件限制只覆盖 multipart 请求体，不代表其他 Content-Type 的 HTTP 请求体上限。
-- 不设固定 PDF 页数上限。能否完成取决于单页尺寸、实际渲染资源、可用磁盘、时间和系统预算。
-- 一个重任务运行、最多一个排队；队列满时返回 `429 JOB_QUEUE_FULL`。长任务返回 `202` 和 `jobId`，用 `GET /api/v1/jobs/{jobId}` 查询进度，用 `POST /api/v1/jobs/{jobId}/cancel` 请求取消。长任务使用 `Idempotency-Key` 防止重复提交。
-- PyMuPDF 重任务、单页文本提取、锚点预检和 PDF 内容校验在独立子进程执行，共用 worker 内存预算 2 GiB、任务墙钟预算 15 分钟和有界队列。超限会终止 worker 并清理任务产物；原会话文件保持不变。LibreOffice 子目录在强制终止后的所有清理边界尚未完整验证，见“已知限制”。
-- **24 MP** 是单页预览预算；超出时降低预览分辨率并提示。**160 MP** 是每个渲染批次的在途像素预算，不是整个导出的累计上限；处理后会释放每批像素缓冲。
-- PDF.js 预览打开有可取消的 **60 秒**总截止；模块/文档加载失败会显示重试入口。页面渲染异常显示页级错误和重试。预览组件持有 loading task，清理时先 `destroy()`，再释放其 Blob URL。
-- `/api/health` 是不依赖 LibreOffice 的轻量存活检查。`/api/health/ready` 返回缓存的 LibreOffice readiness；冷启动探测默认最多等待 20 秒，health 请求不会同步等待。探测超时时状态保持 `unknown`，5 秒后可重试；只有探测明确失败才报告 `not_ready`。本机真实冷启动 readiness 探测耗时约 13 秒。
-- 编辑会话在内存中，服务重启后不会恢复；活动编辑器定期 heartbeat，2 小时无活动后过期。关闭文件会立即清理会话。
+- A single upload is capped at **600 MiB** (`600 × 1024 × 1024` bytes). A `multipart/form-data` request is separately capped at **600 MiB** for the full request body, including every file, field, and boundary; going over returns `413 UPLOAD_TOO_LARGE`. That middleware limit covers multipart bodies only and says nothing about the request body limit for other Content-Types.
+- There is no fixed page limit. Whether a job finishes depends on page size, the rendering resources actually available, disk space, time, and the system budget.
+- One heavy job runs at a time and at most one waits. A full queue returns `429 JOB_QUEUE_FULL`. Long jobs return `202` with a `jobId`, report progress through `GET /api/v1/jobs/{jobId}`, and accept cancellation through `POST /api/v1/jobs/{jobId}/cancel`. They use an `Idempotency-Key` to block duplicate submissions.
+- PyMuPDF heavy jobs, single-page text extraction, anchor preflights, and PDF content validation run in separate subprocesses that share a 2 GiB worker memory budget, a 15-minute wall-clock budget per job, and a bounded queue. Going over either budget kills the worker and cleans up job artifacts; the original session file stays as it was. Cleanup of LibreOffice subdirectories after a forced kill is not fully verified; see "Known limitations".
+- **24 MP** is the per-page preview budget. Above it, the preview drops resolution and says so. **160 MP** is the in-flight pixel budget per rendering batch, not a running total for an export; each batch frees its pixel buffers when it finishes.
+- Opening a PDF.js preview has a cancellable **60-second** overall deadline. Module or document load failures show a retry entry, and a page that fails to render shows a page-level error with retry. Preview components hold the loading task, call `destroy()` during cleanup, then release the Blob URL.
+- `/api/health` is a lightweight liveness check that does not touch LibreOffice. `/api/health/ready` returns the cached LibreOffice readiness state. The cold-start probe waits up to 20 seconds by default, and health requests never wait for it. On timeout the state stays `unknown` and can be retried after 5 seconds; only an explicit probe failure reports `not_ready`. A real cold start on this machine took about 13 seconds.
+- Editing sessions live in memory and do not survive a restart. Open editors send heartbeats, a session expires after 2 hours of inactivity, and closing a file cleans up its session right away.
 
-## 快速开始
+## Quick start
 
-### Windows 一键启动
+### One-click start on Windows
 
-双击项目根目录的 `start-editor.bat`。服务仅绑定 `127.0.0.1`；打开 **http://127.0.0.1:5173**。Office→PDF 需要安装本机 LibreOffice。若自动检测不到，可设置 `PDF_EDITOR_SOFFICE` 指向 `soffice.exe`。
+Double-click `start-editor.bat` in the project root. The service binds only to `127.0.0.1`; open **http://127.0.0.1:5173** to use it. Office→PDF needs a local LibreOffice install. If detection fails, point `PDF_EDITOR_SOFFICE` at `soffice.exe`.
 
-### 手动启动
+### Manual start
 
 ```powershell
-# 后端
+# Backend
 cd backend
 python -m pip install -r requirements.lock
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
-# 前端（另开一个终端）
+# Frontend (second terminal)
 cd frontend
 npm ci --legacy-peer-deps
 npm run dev -- --host 127.0.0.1
 ```
 
-浏览器打开 **http://127.0.0.1:5173**。后端只允许本机 Host，并只接受该前端 Origin；应用没有鉴权，不支持局域网或公网部署。
+Open **http://127.0.0.1:5173** in a browser. The backend accepts only a local Host and this one frontend Origin. There is no authentication, and LAN or public deployment is not supported.
 
-## 编辑器保存、撤销和恢复
+## Editor save, undo, and recovery
 
-- 打开文件后，前端按视口懒加载页面与文本；保存请求携带当前 `revision`。版本过期或文本锚点不匹配时返回 `409 REVISION_CONFLICT`，未确认草稿会保留。
-- 删除、移动页面、插入文字/图片等会影响页面或文本模型的操作，会先要求保存、放弃或取消。另存为会先提交文字草稿。关闭、换文件和重载不会静默丢弃草稿。
-- 可逆操作使用轻量逆操作记录；需要时使用服务端快照。历史最多 10 步、快照总量最多 1 GiB；大文件可能无法保留 10 步。容量不足时会先询问如何继续。页面刷新或从浏览器缓存恢复后，撤销/重做历史从空状态开始。
-- IndexedDB 默认关闭。开启前须逐文档确认文档不敏感；缓存未加密，记录 7 天后过期，可按文档或全部清除。过期记录在下次列出草稿时删除，不承诺浏览器关闭期间定时物理擦除。浏览器配额不足时会显示缓存未保存，不影响服务端会话。
+- After a file opens, the frontend lazy-loads pages and text by viewport, and save requests carry the current `revision`. A stale revision or a mismatched text anchor returns `409 REVISION_CONFLICT`, and unconfirmed drafts are kept.
+- Operations that touch the page or text model, such as deleting or moving pages and inserting text or images, ask for a save, discard, or cancel first. Save-as commits text drafts before writing. Closing, switching files, and reloading never drop a draft silently.
+- Reversible operations use lightweight inverse records, falling back to server snapshots when needed. History holds at most 10 steps and 1 GiB of snapshots, so a large file may keep fewer than 10; the UI asks how to proceed when capacity runs short. After a page refresh or a recovery from the browser cache, undo and redo start empty.
+- IndexedDB is off by default. Confirm per document that the file is not sensitive before turning it on. The cache is unencrypted, records expire after 7 days, and you can clear them per document or all at once. Expired records are deleted the next time drafts are listed; there is no guarantee of timed physical erasure while the browser is closed. If the browser quota runs out, the UI reports that the cache was not saved and the server session carries on.
 
-## 测试和构建
+## Testing and building
 
 ```powershell
-# Python 后端测试及审计/SBOM 工具
+# Python backend tests plus audit / SBOM tooling
 cd backend
 python -m pip install -r requirements-dev.lock
 python -m pytest -ra
 
-# 前端检查
+# Frontend checks
 cd ../frontend
 npm ci --legacy-peer-deps
 npx tsc --noEmit
@@ -78,44 +141,44 @@ npx playwright install chromium
 npm run test:e2e
 ```
 
-`npm run check:pdfjs-resources` compares the installed `pdfjs-dist` version with `package-lock.json`, then checks the exact local CMap, standard-font, and WASM decoder resource file sets and SHA-256 hashes, including JavaScript fallbacks and required license files. It reports differences without changing the resource-loading setup or copying files.
+`npm run check:pdfjs-resources` compares the installed `pdfjs-dist` version with the one pinned in `package-lock.json`, then checks the exact local CMap, standard-font, and WASM decoder resource file sets and SHA-256 hashes, including JavaScript fallbacks and the required license files. It reports differences without changing the resource-loading setup or copying files.
 
-Playwright 配置会启动本地后端和 Vite。可通过 `PYTHON` 指定启动后端的 Python 解释器，该解释器需安装后端锁定依赖（包括 `uvicorn`）。开发机默认使用已安装的 Chrome；CI 使用 Playwright Chromium。GitHub Actions 分别定义 Linux 后端、Windows + LibreOffice 后端、TypeScript/Vitest/Vite build、Chromium E2E、SBOM 与依赖审计任务，并归档测试结果和审计报告。每次 pytest 通过数、跳过数及跳过原因以 CI 报告为准，不把跳过记作通过。
+The Playwright config starts the local backend and Vite. `PYTHON` can point at the interpreter used for the backend, which needs the locked backend dependencies installed, `uvicorn` included. Development machines use the installed Chrome by default and CI uses Playwright Chromium. GitHub Actions runs separate jobs for the Linux backend, the Windows plus LibreOffice backend, TypeScript / Vitest / Vite build, Chromium E2E, SBOM, and dependency audit, and archives test results and audit reports. For any given pytest run, the pass count, skip count, and skip reasons come from the CI report; skips do not count as passes.
 
-前端要求 Node.js 22.22.2 或更新的兼容版本。安装命令与 CI 一致使用 `--legacy-peer-deps`，以避开 npm 10 对 Vitest 4 可选 peer 依赖树的解析崩溃；测试所需的 `@testing-library/dom` 已列为直接开发依赖。
+The frontend needs Node.js 22.22.2 or a newer compatible release. Install commands match CI and use `--legacy-peer-deps`, which avoids npm 10 crashing on the optional peer dependency tree of Vitest 4. `@testing-library/dom`, which the tests need, is a direct development dependency.
 
-### 两项显示修复回归（2026-10-27）
+### Regression log: two display fixes (2026-10-27)
 
-- PDF.js 的 URL 加载与字节预览均配置本地 `wasmUrl`；新增与锁定版本一致的 13 项解码器、JavaScript fallback 和许可证资源，恢复扫描 PDF 中 CCITT/JBIG2 等图像蒙版的显示。合成 CCITT ImageMask 浏览器回归验证解码器请求和实际画布像素；资源篡改夹具会被 SHA-256 校验拒绝。
-- 未编辑文字的 textarea 文字和背景保持透明，显示原 PDF canvas 的字体与位置；点击后进入编辑，草稿在失焦及工具切换后仍可见。未改动行失焦、草稿撤销回原文或保存刷新后恢复 canvas 外观；查找使用半透明高亮。懒加载淘汰行模型时清除焦点状态，避免重载后出现旧编辑框。
-- 本机验证：pytest **115 passed**；Vitest **56/56**；TypeScript 与 production build 通过；Chrome 开发模式全量 **18/18**、production preview 全量 **18/18**。搜索请求等待条件最终调整后，开发模式同一显示回归另行通过 **1/1**。既有 Starlette/httpx 弃用、动态/静态导入与大 chunk 提示仍存在。
-- 两份用户原件用于实际浏览器回归：扫描件第 1、2 页验证解码器阻断/恢复对照；公文 3 页的闲置完整 DOM 与隐藏文字覆盖层的画布截图逐像素一致。原件 SHA-256 前后一致，原件及截图未提交 Git；本次本地证据保存在仓库外 `E:\worksapce\PDF demo1\render-evidence-20261027`。
-- 本轮仅修复预览显示；正在编辑的文字仍使用现有浏览器编辑控件，保存继续采用既有后端文字替换机制。搜索提取未结束时可能触发现有任务队列繁忙边界；回归在明确等待提取完成后验证保存，未改变队列限制。
+- PDF.js URL loading and byte-based previews both set a local `wasmUrl`. The 13 decoders, JavaScript fallbacks, and license files that match the pinned version were added, which restored image masks such as CCITT and JBIG2 in scanned PDFs. A synthetic CCITT ImageMask browser regression checks the decoder requests and the actual canvas pixels, and a tampered-resource fixture is rejected by the SHA-256 check.
+- The textarea for unedited text keeps text and background transparent, showing the original canvas font and position. A click enters editing, and drafts stay visible after blur and across tool switches. The canvas look comes back when you blur a line you did not change, undo a draft back to the original, or save and reload. Find uses a translucent highlight. Evicting a lazily loaded line model clears focus state, so no stale editor box reappears after a reload.
+- Local verification: pytest **115 passed**, Vitest **56/56**, TypeScript and production build pass, Chrome full suite **18/18** in development mode and **18/18** against the production preview. After the last adjustment to the search wait condition, the same display regression passed separately **1/1** in development mode. The existing Starlette / httpx deprecation notices and the dynamic / static import and large-chunk warnings are still there.
+- Two source documents from the user went through the browser regression: pages 1 and 2 of the scan, compared with the decoder blocked and then restored, and all three pages of the official document, where screenshots of the idle full DOM and of the canvas with the text overlay hidden matched pixel for pixel. Source SHA-256 values match before and after. The source files and screenshots were not committed, and the local evidence sits outside the repo at `E:\worksapce\PDF demo1\render-evidence-20261027`.
+- This round fixed preview display only. Text under active editing still uses the existing browser editing control, and saving still goes through the existing backend text replacement. A search extraction that has not finished can still hit the existing busy job queue; the regression waits for extraction to complete before checking the save and leaves the queue limits alone.
 
-### 本机 v0.2 整改回归记录（2026-10-21）
+### Regression log: v0.2 remediation (2026-10-21)
 
-- 后端锁定环境：pytest **115 passed，0 skipped**；包含 F01/F02 相关服务端回归、长文字溢出 API 与真实 PDF 输出、F10–F13 回归及 Office→PDF 成功路径。收到一条既有 Starlette/httpx 弃用提示。
-- 前端：TypeScript 检查通过，Vitest **54/54**，Vite production build 成功。
-- Playwright Chromium 开发模式 **16/16**、Production preview 模式 **16/16**。包含 F01 双 save-race、草稿恢复、新增长文字溢出真实浏览器流程、transient 503 后预览重试及 StrictMode 文件切换/卸载；preview 全套访问 `4173` 的 production preview。
-- PDF.js 静态资源检查通过：锁定及安装版本均为 `6.4.299`；169 个 CMap 目录文件和 16 个 standard-font 目录文件（均包含相应许可文件）逐文件 SHA-256 一致。篡改资源的临时故障夹具被脚本拒绝。
-- 预览打开有可取消的 60 秒截止；Vitest 故障注入验证打开超时、render rejection、重试、卸载和 `loadingTask.destroy()` 后释放 Blob URL。真实浏览器 transient 503 后重试读取并渲染真实 PDF 成功。
-- Windows 一键启动器修复 CRLF 行尾后实跑通过，显示 `Ready!`；后端和 Vite 代理 health 均返回 `200`。Git checkout 由 `.gitattributes` 固定批处理文件为 CRLF。
-- Vite build 仍有 `EditorPage.tsx` 动态/静态导入提示和大于 500 kB 的 chunk 提示；不影响 build 成功。
-- 本次未运行 `pip-audit`、`npm audit`、CycloneDX 或托管 CI，也未 push；这些结果不能记作本次通过。
+- Backend, locked environment: pytest **115 passed, 0 skipped**, covering the F01 and F02 server-side regressions, the long-text overflow API with real PDF output, the F10-F13 regressions, and the Office→PDF success path, with one pre-existing Starlette / httpx deprecation notice.
+- Frontend: TypeScript passes, Vitest **54/54**, Vite production build succeeds.
+- Playwright Chromium: **16/16** in development mode and **16/16** against the production preview, covering the F01 double save-race, draft recovery, the new long-text overflow flow in a real browser, preview retry after a transient 503, and StrictMode file switching and unmount. The preview suite runs against the production preview on port `4173`.
+- PDF.js static resource check passes. The pinned and installed versions are both `6.4.299`, and the 169 CMap directory files and 16 standard-font directory files, each with its license file, match per-file SHA-256. A temporary fault fixture with a tampered resource was rejected by the script.
+- Preview opening has a cancellable 60-second deadline. Vitest fault injection covers the open timeout, render rejection, retry, unmount, and Blob URL release after `loadingTask.destroy()`. A real browser retried after a transient 503 and then read and rendered a real PDF.
+- After the CRLF fix, the Windows launcher ran through to `Ready!`, and both the backend and the Vite-proxied health checks returned `200`. `.gitattributes` pins batch files to CRLF on checkout.
+- The Vite build still reports the `EditorPage.tsx` dynamic / static import notice and a chunk over 500 kB. Neither affects build success.
+- This run did not execute `pip-audit`, `npm audit`, CycloneDX, or hosted CI, and did not push. None of those results count as passing for this run.
 
-## 已知限制
+## Known limitations
 
-1. PDF→Word 是尽力而为的版式重建，复杂排版和扫描件需校对；本项目没有 OCR。
-2. Office→PDF 依赖本机 LibreOffice。readiness 探测有 20 秒预算；超时表示探测未能在预算内完成，会返回 `unknown` 并在短暂冷却后重试。实际冷启动路径已通过本机验证。转换操作另有 180 秒超时。
-3. 密码保护的 PDF 暂不支持处理；文档信息工具会将加密状态显示为“是 / 否 / 无法确认”。
-4. PDF 对象优化不做图像降采样，文件变小的幅度取决于具体文档。
-5. 浏览器本地恢复缓存未加密；不要对敏感文件开启。超过 7 天的记录在下次列出草稿时删除，不提供浏览器关闭期间的定时物理擦除保证。
-6. LibreOffice 进程树有 Windows Job Object 管理；强制终止发生在外部转换的不同阶段时，所有 profile/临时目录清理路径尚未逐一验证。
-7. 极端字体、非标准页面 box/UserUnit、签名/表单保真、600 MiB 文件、15 分钟任务及长期磁盘压力未做穷尽验证；不声称任意 PDF 的格式保真。
-8. PDF 打开过程有 60 秒截止并支持重试；每页 render 抛错时可单页重试。单页 render promise 永久 pending 没有独立的页面级截止时间。
-9. 本次未对运行时所有网络外呼做全流量审计，也未运行托管 GitHub Actions；本机检查不能替代这些证据。
-10. 安装依赖时需要访问 Python/npm 软件源；安装完成后，PDF 处理不依赖云服务。
+1. PDF→Word is a best-effort layout reconstruction. Complex layouts and scans need a human to check them; the project has no OCR.
+2. Office→PDF needs a local LibreOffice. The readiness probe has a 20-second budget; a timeout means the probe did not finish in time, which returns `unknown` and retries after a short cooldown. The real cold-start path has been verified on this machine. Conversion has its own 180-second timeout.
+3. Password-protected PDFs are not supported yet. The document info tool reports encryption as "yes / no / undetermined".
+4. PDF object optimization does not downsample images, so how much smaller a file gets depends on the document.
+5. The browser recovery cache is unencrypted, so do not turn it on for sensitive files. Records older than 7 days are deleted the next time drafts are listed, with no guarantee of timed erasure while the browser is closed.
+6. A Windows Job Object manages the LibreOffice process tree. When a forced kill lands at a different stage of an external conversion, not every profile and temp directory cleanup path has been verified.
+7. Extreme fonts, non-standard page boxes and UserUnit, signature and form fidelity, 600 MiB files, 15-minute jobs, and long-term disk pressure have not been exhaustively tested. No claim is made about format fidelity for arbitrary PDFs.
+8. PDF opening has a 60-second deadline and supports retry, and a page whose render throws can be retried on its own. A render promise that stays pending forever has no separate page-level deadline.
+9. Not every outbound request has been through a full traffic audit, and hosted GitHub Actions has not run. Local checks do not replace that evidence.
+10. Installing dependencies needs access to Python and npm package sources. Once installed, PDF processing uses no cloud service.
 
-## 许可证
+## License
 
-仓库根目录 `LICENSE` 保持原样。第三方依赖许可和 PyMuPDF 双许可说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。个人离线自用验收不要求先完成公开分发许可选择；若未来公开分发，项目所有者须先选择并记录 AGPL-3.0 或 Artifex 商业许可路径，再完成对应检查。
+`LICENSE` in the repository root is unchanged. Third-party licenses and the PyMuPDF dual-licensing note are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Personal offline acceptance does not require settling the public distribution license first. Before any public release, the project owner has to pick and record either AGPL-3.0 or the Artifex commercial route, then run the corresponding checks.
