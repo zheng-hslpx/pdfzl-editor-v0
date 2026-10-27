@@ -1985,6 +1985,7 @@ function EditorCanvas(props: EditorCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
+  const [focusedLineId, setFocusedLineId] = useState<string | null>(null);
   const [dragRect, setDragRect] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const [nearViewport, setNearViewport] = useState(false);
   const [rendered, setRendered] = useState(false);
@@ -1994,6 +1995,12 @@ function EditorCanvas(props: EditorCanvasProps) {
 
   const widthCss = page.width * scale;
   const heightCss = page.height * scale;
+
+  useEffect(() => {
+    if (focusedLineId && (page.rotation !== 0 || !pageModel?.lines.some((line) => line.id === focusedLineId))) {
+      setFocusedLineId(null);
+    }
+  }, [focusedLineId, page.rotation, pageModel]);
 
   useEffect(() => {
     const node = containerRef.current;
@@ -2174,6 +2181,8 @@ function EditorCanvas(props: EditorCanvasProps) {
           {page.rotation === 0 ? (pageModel?.lines ?? []).map((line) => {
             const [x0, y0, x1, y1] = line.bbox;
             const value = edits[line.id] ?? line.text;
+            // Let the PDF canvas retain the original font and positioning until editing.
+            const showEditor = value !== line.text || (mode === "select" && focusedLineId === line.id);
             const fontStyle = FONT_STYLES[line.font] ?? FONT_STYLES.helv!;
             const height = Math.max((y1 - y0) * scale, line.fontSize * scale * 1.35);
             return (
@@ -2182,6 +2191,8 @@ function EditorCanvas(props: EditorCanvasProps) {
                 value={value}
                 readOnly={mode !== "select" || page.rotation !== 0 || textEditLocked}
                 onChange={(e) => onLineChange(line.id, e.target.value)}
+                onFocus={() => setFocusedLineId(line.id)}
+                onBlur={() => setFocusedLineId(null)}
                 title={page.rotation !== 0 ? "旋转页暂不支持编辑，请先用旋转工具归一化" : undefined}
                 style={{
                   position: "absolute",
@@ -2191,8 +2202,8 @@ function EditorCanvas(props: EditorCanvasProps) {
                   height,
                   fontSize: line.fontSize * scale,
                   lineHeight: 1.15,
-                  color: line.color,
-                  background: findMatches.has(line.id) ? "#fff3bf" : "#fff",
+                  color: showEditor ? line.color : "transparent",
+                  background: showEditor ? "#fff" : findMatches.has(line.id) ? "rgba(255, 224, 102, 0.3)" : "transparent",
                   border: "none",
                   outline: "none",
                   resize: "none",

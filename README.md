@@ -84,6 +84,14 @@ Playwright 配置会启动本地后端和 Vite。可通过 `PYTHON` 指定启动
 
 前端要求 Node.js 22.22.2 或更新的兼容版本。安装命令与 CI 一致使用 `--legacy-peer-deps`，以避开 npm 10 对 Vitest 4 可选 peer 依赖树的解析崩溃；测试所需的 `@testing-library/dom` 已列为直接开发依赖。
 
+### 两项显示修复回归（2026-10-27）
+
+- PDF.js 的 URL 加载与字节预览均配置本地 `wasmUrl`；新增与锁定版本一致的 13 项解码器、JavaScript fallback 和许可证资源，恢复扫描 PDF 中 CCITT/JBIG2 等图像蒙版的显示。合成 CCITT ImageMask 浏览器回归验证解码器请求和实际画布像素；资源篡改夹具会被 SHA-256 校验拒绝。
+- 未编辑文字的 textarea 文字和背景保持透明，显示原 PDF canvas 的字体与位置；点击后进入编辑，草稿在失焦及工具切换后仍可见。未改动行失焦、草稿撤销回原文或保存刷新后恢复 canvas 外观；查找使用半透明高亮。懒加载淘汰行模型时清除焦点状态，避免重载后出现旧编辑框。
+- 本机验证：pytest **115 passed**；Vitest **56/56**；TypeScript 与 production build 通过；Chrome 开发模式全量 **18/18**、production preview 全量 **18/18**。搜索请求等待条件最终调整后，开发模式同一显示回归另行通过 **1/1**。既有 Starlette/httpx 弃用、动态/静态导入与大 chunk 提示仍存在。
+- 两份用户原件用于实际浏览器回归：扫描件第 1、2 页验证解码器阻断/恢复对照；公文 3 页的闲置完整 DOM 与隐藏文字覆盖层的画布截图逐像素一致。原件 SHA-256 前后一致，原件及截图未提交 Git；本次本地证据保存在仓库外 `E:\worksapce\PDF demo1\render-evidence-20261027`。
+- 本轮仅修复预览显示；正在编辑的文字仍使用现有浏览器编辑控件，保存继续采用既有后端文字替换机制。搜索提取未结束时可能触发现有任务队列繁忙边界；回归在明确等待提取完成后验证保存，未改变队列限制。
+
 ### 本机 v0.2 整改回归记录（2026-10-21）
 
 - 后端锁定环境：pytest **115 passed，0 skipped**；包含 F01/F02 相关服务端回归、长文字溢出 API 与真实 PDF 输出、F10–F13 回归及 Office→PDF 成功路径。收到一条既有 Starlette/httpx 弃用提示。

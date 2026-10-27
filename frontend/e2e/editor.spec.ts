@@ -320,6 +320,66 @@ test("renders PDF tool results under StrictMode across file changes and unmount"
   expect(pdfErrors).toEqual([]);
 });
 
+test("preserves original canvas pixels until editing and keeps drafts visible across modes and save", async ({ page }) => {
+  const textRequests = new Set<import("@playwright/test").Request>();
+  page.on("request", (request) => {
+    if (/\/pages\/\d+\/text$/.test(new URL(request.url()).pathname)) textRequests.add(request);
+  });
+  page.on("requestfinished", (request) => textRequests.delete(request));
+  page.on("requestfailed", (request) => textRequests.delete(request));
+  await page.goto("/editor");
+  await openSample(page);
+  const container = page.locator('[data-page-number="0"]');
+  const overlay = page.getByTestId("text-overlay-page-0");
+  const textbox = container.locator("textarea").first();
+  await expect(container.locator("canvas")).toBeVisible();
+  const assertCanvasAppearance = async () => {
+    const toolbar = page.locator('[style*="position: sticky"]').first();
+    await toolbar.evaluate((node) => { node.style.visibility = "hidden"; });
+    try {
+      await expect.poll(async () => {
+        const visible = await container.screenshot({ animations: "disabled" });
+        await overlay.evaluate((node) => { node.style.visibility = "hidden"; });
+        const bare = await container.screenshot({ animations: "disabled" });
+        await overlay.evaluate((node) => { node.style.visibility = ""; });
+        return visible.equals(bare);
+      }).toBe(true);
+    } finally {
+      await overlay.evaluate((node) => { node.style.visibility = ""; });
+      await toolbar.evaluate((node) => { node.style.visibility = ""; });
+    }
+  };
+  await assertCanvasAppearance();
+  await page.getByPlaceholder("查找文本…").fill("PAGE-1");
+  await expect(textbox).toHaveCSS("color", "rgba(0, 0, 0, 0)");
+  await expect(textbox).toHaveCSS("background-color", "rgba(255, 224, 102, 0.3)");
+  await page.getByPlaceholder("查找文本…").fill("");
+  // Search extracts other pages under the session lock; finish those reads before saving.
+  await expect.poll(() => textRequests.size).toBe(0);
+  await textbox.click();
+  await expect(textbox).toHaveCSS("background-color", "rgb(255, 255, 255)");
+  await textbox.blur();
+  await expect(textbox).toHaveCSS("color", "rgba(0, 0, 0, 0)");
+  await textbox.fill("EDITED CANVAS");
+  await textbox.blur();
+  await expect(textbox).toHaveCSS("color", "rgb(0, 0, 0)");
+  await page.getByText("加文字", { exact: true }).click();
+  await expect(textbox).toHaveValue("EDITED CANVAS");
+  await expect(textbox).toHaveCSS("background-color", "rgb(255, 255, 255)");
+  await page.getByText("选择/改字", { exact: true }).click();
+  await page.getByRole("button", { name: "撤销", exact: true }).click();
+  await expect(textbox).toHaveValue("PAGE-1 EDITABLE");
+  await expect(textbox).toHaveCSS("color", "rgba(0, 0, 0, 0)");
+  await page.getByRole("button", { name: "重做", exact: true }).click();
+  await expect(textbox).toHaveValue("EDITED CANVAS");
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(page.getByText("已保存 1 处修改", { exact: true })).toBeVisible();
+  await expect(textbox).toHaveValue("EDITED CANVAS");
+  await expect(textbox).toHaveCSS("color", "rgba(0, 0, 0, 0)");
+  await expect(container.locator("canvas")).toBeVisible();
+  await assertCanvasAppearance();
+});
+
 test("shows a retryable editor preview error and recovers after a transient PDF load failure", async ({ page }) => {
   let pdfLoadAttempts = 0;
   await page.route(

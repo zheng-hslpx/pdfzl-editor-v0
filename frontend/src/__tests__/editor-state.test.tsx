@@ -117,7 +117,8 @@ async function openSample(container: HTMLElement, expectTextOverlay = true) {
   }
   await waitFor(() => expect(mocks.fetchPageText).toHaveBeenCalled());
   if (expectTextOverlay) {
-    expect(window.getComputedStyle(container.querySelector("textarea")!).backgroundColor).toBe("rgb(255, 255, 255)");
+    expect(window.getComputedStyle(container.querySelector("textarea")!).backgroundColor).toBe("rgba(0, 0, 0, 0)");
+    expect(window.getComputedStyle(container.querySelector("textarea")!).color).toBe("rgba(0, 0, 0, 0)");
   }
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
@@ -172,6 +173,23 @@ describe("editor dirty-draft protection", () => {
       }),
       destroy: vi.fn().mockResolvedValue(undefined),
     });
+  });
+
+  it("shows only the focused editor or changed draft and restores canvas appearance on blur and undo", async () => {
+    const { container } = renderEditor();
+    await openSample(container);
+    const textbox = container.querySelector("textarea")!;
+    fireEvent.focus(textbox);
+    expect(textbox.style.background).toBe("rgb(255, 255, 255)");
+    fireEvent.blur(textbox);
+    expect(textbox.style.background).toBe("transparent");
+    fireEvent.change(textbox, { target: { value: "VISIBLE DRAFT" } });
+    fireEvent.blur(textbox);
+    expect(textbox.style.color).toBe("rgb(0, 0, 0)");
+    expect(textbox.style.background).toBe("rgb(255, 255, 255)");
+    fireEvent.click(screen.getByRole("button", { name: "撤销" }));
+    expect(textbox.style.background).toBe("transparent");
+    expect(textbox.style.color).toBe("transparent");
   });
 
   it("keeps the draft when closing is cancelled, and only discards after confirmation", async () => {
@@ -500,6 +518,23 @@ describe("editor dirty-draft protection", () => {
       "/api/v1/edit/session-1/download",
       expect.objectContaining({ shouldCancel: expect.any(Function) }),
     );
+    const textbox = container.querySelector("textarea")!;
+    fireEvent.focus(textbox);
+    expect(textbox.style.background).toBe("rgb(255, 255, 255)");
+    const observer = observers.find((entry) => entry.targets.some((target) => target.getAttribute("data-page-number") === "0"))!;
+    const target = observer.targets.find((node) => node.getAttribute("data-page-number") === "0")!;
+    act(() => observer.callback(
+      [{ target, isIntersecting: false } as IntersectionObserverEntry],
+      observer as unknown as IntersectionObserver,
+    ));
+    await waitFor(() => expect(container.querySelector("textarea")).toBeNull());
+    act(() => observer.callback(
+      [{ target, isIntersecting: true } as IntersectionObserverEntry],
+      observer as unknown as IntersectionObserver,
+    ));
+    await waitFor(() => expect(container.querySelector("textarea")).not.toBeNull());
+    expect(container.querySelector("textarea")!.style.background).toBe("transparent");
+    expect(container.querySelector("textarea")!.style.color).toBe("transparent");
   });
 
   it("keeps a 300-page document within a small rendered window and requests metadata by slice", async () => {
