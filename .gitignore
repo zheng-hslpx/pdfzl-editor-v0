@@ -26,6 +26,9 @@ samples/out/
 /artifacts/
 backend/pytest-*.xml
 
+# Local review evidence
+review/
+
 # OS
 .DS_Store
 Thumbs.db
