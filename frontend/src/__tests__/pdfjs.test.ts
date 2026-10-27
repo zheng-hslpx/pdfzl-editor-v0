@@ -45,7 +45,7 @@ describe("openPdfDocument byte ownership", () => {
     expect(getDocument).not.toHaveBeenCalled();
   });
 
-  it("uses bundled CMaps and standard fonts for URL-based range loads", async () => {
+  it("uses bundled CMaps, fonts and image decoders for URL-based range loads", async () => {
     getDocument.mockReturnValue(task);
 
     await openPdfDocument("/api/v1/edit/session-1/download");
@@ -55,7 +55,16 @@ describe("openPdfDocument byte ownership", () => {
       cMapUrl: `${window.location.origin}/cmaps/`,
       cMapPacked: true,
       standardFontDataUrl: `${window.location.origin}/standard_fonts/`,
+      wasmUrl: `${window.location.origin}/wasm/`,
       disableStream: true,
+    }));
+  });
+
+  it("uses the same local image decoders for byte-based PDF previews", async () => {
+    getDocument.mockReturnValue(task);
+    await openPdfDocument(new Uint8Array([1, 2, 3]));
+    expect(getDocument).toHaveBeenCalledWith(expect.objectContaining({
+      wasmUrl: `${window.location.origin}/wasm/`,
     }));
   });
 });

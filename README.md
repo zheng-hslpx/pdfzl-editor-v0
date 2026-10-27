@@ -78,7 +78,7 @@ npx playwright install chromium
 npm run test:e2e
 ```
 
-`npm run check:pdfjs-resources` compares the installed `pdfjs-dist` version with `package-lock.json`, then checks the exact local CMap and standard-font file sets and SHA-256 hashes, including the required license files. It reports differences without changing the resource-loading setup or copying files.
+`npm run check:pdfjs-resources` compares the installed `pdfjs-dist` version with `package-lock.json`, then checks the exact local CMap, standard-font, and WASM decoder resource file sets and SHA-256 hashes, including JavaScript fallbacks and required license files. It reports differences without changing the resource-loading setup or copying files.
 
 Playwright 配置会启动本地后端和 Vite。可通过 `PYTHON` 指定启动后端的 Python 解释器，该解释器需安装后端锁定依赖（包括 `uvicorn`）。开发机默认使用已安装的 Chrome；CI 使用 Playwright Chromium。GitHub Actions 分别定义 Linux 后端、Windows + LibreOffice 后端、TypeScript/Vitest/Vite build、Chromium E2E、SBOM 与依赖审计任务，并归档测试结果和审计报告。每次 pytest 通过数、跳过数及跳过原因以 CI 报告为准，不把跳过记作通过。
 

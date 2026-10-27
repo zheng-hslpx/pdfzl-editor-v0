@@ -13,6 +13,15 @@ const resourceSets = [
     local: "public/standard_fonts",
     requiredLicenses: ["LICENSE_FOXIT", "LICENSE_LIBERATION"],
   },
+  {
+    name: "wasm",
+    source: "wasm",
+    local: "public/wasm",
+    requiredLicenses: [
+      "LICENSE_JBIG2", "LICENSE_OPENJPEG", "LICENSE_QCMS",
+      "LICENSE_PDFJS_JBIG2", "LICENSE_PDFJS_OPENJPEG", "LICENSE_PDFJS_QCMS",
+    ],
+  },
 ];
 
 async function listRegularFiles(root, directory) {

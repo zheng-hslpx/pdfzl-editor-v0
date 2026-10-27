@@ -82,6 +82,7 @@ function localPdfResources() {
     cMapUrl: new URL(`${import.meta.env.BASE_URL}cmaps/`, window.location.origin).href,
     cMapPacked: true,
     standardFontDataUrl: new URL(`${import.meta.env.BASE_URL}standard_fonts/`, window.location.origin).href,
+    wasmUrl: new URL(`${import.meta.env.BASE_URL}wasm/`, window.location.origin).href,
   };
 }
 
