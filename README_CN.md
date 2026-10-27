@@ -4,7 +4,7 @@
 
 本机运行的单用户 PDF 工具。文档在本机处理，后端和 Vite 默认只监听 `127.0.0.1`。服务没有登录鉴权，不要绑到局域网或公网地址。项目按本机处理来设计，但运行时到底往外发了哪些请求，还没做过全量审计。
 
-截至 2026-10-27，F01-F13 的缺陷整改、四项最终验收补充整改和两项显示修复都已完成，本机要求的 pytest、Vitest、TypeScript、production build 以及开发和生产环境的 E2E 全部通过。**建议 PDF Editor v0.2.0 通过个人离线自用的正式验收**。源代码已公开在 GitHub，但还没有发布安装包或 Release，公开分发前的许可选择也仍未完成。还有两处没有验证到底：一是 LibreOffice 被强制终止后外部临时目录的清理，二是极端 PDF 和资源压力下的表现。PyMuPDF 走 AGPL 还是 Artifex 商业许可，是将来公开分发前由项目所有者决定的事，不构成个人离线自用验收的阻断项。产品范围不含 OCR、表单、批注，也没有真正的安全 redaction。工具注册表现在有 **11 个入口**，其中“格式转换”一个入口里包含 5 种转换。
+截至 2026-10-27，F01-F13 的缺陷整改、四项最终验收补充整改和两项显示修复都已完成，本机要求的 pytest、Vitest、TypeScript、production build 以及开发和生产环境的 E2E 全部通过。**建议 PDF Editor v0.2.0 通过个人离线自用的正式验收**。源代码已公开在 GitHub，但还没有发布安装包或 Release。还有两处没有验证到底：一是 LibreOffice 被强制终止后外部临时目录的清理，二是极端 PDF 和资源压力下的表现。PyMuPDF 走 AGPL 还是 Artifex 商业许可，是将来公开分发前由项目所有者决定的事，不构成个人离线自用验收的阻断项。产品范围不含 OCR、表单、批注，也没有真正的安全 redaction。工具注册表现在有 **11 个入口**，其中“格式转换”一个入口里包含 5 种转换。
 
 ## 版本更新
 
@@ -179,6 +179,17 @@ Playwright 配置会启动本地后端和 Vite。可以用 `PYTHON` 指定启动
 9. 运行时所有网络外呼没做过全流量审计，托管 GitHub Actions 也没跑过，本机检查替代不了这两项证据。
 10. 装依赖要访问 Python / npm 软件源；装完之后，PDF 处理不依赖任何云服务。
 
+## 项目定位
+
+本项目是作者自用的本机离线 PDF 工具，代码公开供学习参考。作者不提供商业支持，也不承诺在生产环境可用。这段话说明的是项目定位与支持范围，不构成对许可授予权利的额外限制，具体授权以 [LICENSE](LICENSE) 为准。
+
 ## 许可证
 
-仓库根目录的 `LICENSE` 保持原样。第三方依赖许可和 PyMuPDF 双许可说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。个人离线自用验收不要求先定下公开分发的许可；将来真要公开分发，项目所有者得先选定并记录走 AGPL-3.0 还是 Artifex 商业许可，再做对应的检查。
+Copyright © 2026 Hongsen Zheng。
+
+本仓库按目录分别授权：
+
+- 根目录 `LICENSE` 是 **AGPL-3.0**，默认覆盖整个仓库，`backend/` 也在其中。后端通过 PyMuPDF 处理 PDF，而 PyMuPDF 采用 AGPL-3.0 或 Artifex 商业双许可，所以后端与整个作品按 AGPL-3.0 发布，本项目未购买 Artifex 商业许可。
+- `frontend/` 是独立程序，通过 HTTP API 调用后端，不链接 PyMuPDF，单独采用 **MIT**，见 [frontend/LICENSE](frontend/LICENSE)。
+
+这个划分自 2026-10-27 起生效；此前提交按 MIT 发布，已经发出的 MIT 授权继续有效。第三方依赖、捆绑资源与 PyMuPDF 的许可说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

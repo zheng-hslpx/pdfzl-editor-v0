@@ -2,9 +2,9 @@
 
 This file records the direct dependency license metadata for the v0.1 lock files. It is an inventory for project-owner review, not a legal opinion or a substitute for the license texts distributed by the upstream projects. The complete resolved dependency trees are emitted as CycloneDX SBOM artifacts by CI.
 
-## License decision required before public distribution
+## Licensing decision
 
-PyMuPDF 1.27.2.3 is dual licensed under the GNU AGPL-3.0 or an Artifex commercial license. The project owner has not recorded which licensing path applies to this project. The root `LICENSE` is left unchanged; it does not resolve the separate PyMuPDF dependency terms. Before public distribution, the owner must choose and document the applicable path and complete the associated obligations. See the [PyMuPDF licensing documentation](https://pymupdf.readthedocs.io/en/latest/faq/index.html) and [Artifex licensing information](https://artifex.com/licensing).
+PyMuPDF 1.27.2.3 is dual licensed under the GNU AGPL-3.0 or an Artifex commercial license. This project takes the AGPL-3.0 path: the root `LICENSE` is AGPL-3.0 and covers the repository by default, `backend/` included, because the backend links PyMuPDF. No Artifex commercial license is held. The `frontend/` directory is a separate program that calls the backend over an HTTP API and does not link PyMuPDF, so it stays under MIT; see `frontend/LICENSE`. See the [PyMuPDF licensing documentation](https://pymupdf.readthedocs.io/en/latest/faq/index.html) and [Artifex licensing information](https://artifex.com/licensing) for the upstream terms.
 
 ## Direct Python dependencies
 

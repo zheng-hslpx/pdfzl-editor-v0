@@ -4,7 +4,7 @@
 
 A single-user PDF toolkit that runs on your own machine. Documents stay local, and the backend and the Vite dev server bind to `127.0.0.1` by default. There is no authentication, so do not expose the service to a LAN or the internet. The design assumes local use, but nobody has audited every request the app makes at runtime.
 
-As of 2026-10-27, the F01-F13 defects, the four follow-up acceptance items, and the two display fixes are all done. The pytest, Vitest, TypeScript, production build, and E2E runs this machine requires all pass, in development and against the production preview. **PDF Editor v0.2.0 is recommended to pass formal acceptance for personal offline use.** The source is public on GitHub, but there is no installer or Release yet, and the license choice for public distribution is still open. Two areas are still unverified: cleanup of external temp directories after LibreOffice is force-killed, and behavior under extreme PDFs or resource pressure. Whether PyMuPDF ships under AGPL or an Artifex commercial license is an owner decision for any future public distribution; it does not block personal offline use. The product does not do OCR, forms, annotations, or real secure redaction. The tool registry has **11 entries**, and the "Format conversion" entry covers 5 conversions.
+As of 2026-10-27, the F01-F13 defects, the four follow-up acceptance items, and the two display fixes are all done. The pytest, Vitest, TypeScript, production build, and E2E runs this machine requires all pass, in development and against the production preview. **PDF Editor v0.2.0 is recommended to pass formal acceptance for personal offline use.** The source is public on GitHub, but there is no installer or Release yet. Two areas are still unverified: cleanup of external temp directories after LibreOffice is force-killed, and behavior under extreme PDFs or resource pressure. Whether PyMuPDF ships under AGPL or an Artifex commercial license is an owner decision for any future public distribution; it does not block personal offline use. The product does not do OCR, forms, annotations, or real secure redaction. The tool registry has **11 entries**, and the "Format conversion" entry covers 5 conversions.
 
 ## Version history
 
@@ -179,6 +179,17 @@ The frontend needs Node.js 22.22.2 or a newer compatible release. Install comman
 9. Not every outbound request has been through a full traffic audit, and hosted GitHub Actions has not run. Local checks do not replace that evidence.
 10. Installing dependencies needs access to Python and npm package sources. Once installed, PDF processing uses no cloud service.
 
+## Scope
+
+This is a personal, offline PDF tool that the author publishes for learning and reference. There is no commercial support, and no promise that it is fit for production. This paragraph describes the project's scope and support level. It does not add restrictions to the rights the licenses grant; the licenses govern.
+
 ## License
 
-`LICENSE` in the repository root is unchanged. Third-party licenses and the PyMuPDF dual-licensing note are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Personal offline acceptance does not require settling the public distribution license first. Before any public release, the project owner has to pick and record either AGPL-3.0 or the Artifex commercial route, then run the corresponding checks.
+Copyright (c) 2026 Hongsen Zheng.
+
+The repository is licensed per directory:
+
+- The root `LICENSE` is **AGPL-3.0** and covers the repository by default, `backend/` included. The backend processes PDFs through PyMuPDF, which is dual licensed under AGPL-3.0 or an Artifex commercial license, so the backend and the combined work ship under AGPL-3.0. No Artifex commercial license is held.
+- `frontend/` is a separate program that calls the backend over an HTTP API and does not link PyMuPDF. It is licensed **MIT**; see [frontend/LICENSE](frontend/LICENSE).
+
+The split took effect on 2026-10-27. Earlier commits were published under MIT, and those grants remain valid. Third-party dependencies, bundled resources, and the PyMuPDF terms are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
