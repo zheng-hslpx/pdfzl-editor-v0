@@ -29,10 +29,17 @@ jobs:
       - name: Install locked development dependencies
         run: python -m pip install -r backend/requirements-dev.lock
       - name: Run backend tests with real LibreOffice
-        run: python -m pytest backend/tests -ra --junitxml=backend/pytest-windows.xml
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest backend/tests -ra --junitxml=backend/pytest-windows.xml 2>&1 | tee backend/pytest-output.txt
       - name: Report failing tests as annotations
-        if: failure()
-        run: python .github/scripts/report_failures.py backend/pytest-windows.xml
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+        run: python .github/scripts/report_failures.py backend/pytest-output.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
