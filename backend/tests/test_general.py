@@ -102,7 +102,10 @@ def test_readiness_probe_timeout_is_inconclusive_and_retried(client, monkeypatch
 
     monkeypatch.setattr(libreoffice, "soffice_available", lambda: True)
     monkeypatch.setattr(libreoffice, "_probe_cache", None)
-    monkeypatch.setattr(libreoffice, "_probe_checked_at", 0.0)
+    # Relative to now, not to 0.0: time.monotonic() counts from boot, and a
+    # freshly provisioned CI runner can have an uptime below the retry window,
+    # which would leave the probe untriggered.
+    monkeypatch.setattr(libreoffice, "_probe_checked_at", time.monotonic() - 1e6)
     monkeypatch.setattr(libreoffice, "_probe_checked_wall", None)
     monkeypatch.setattr(libreoffice, "_probe_task", None)
     monkeypatch.setattr(libreoffice, "_probe_functional", probe_sequence)
